@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Procedural Planet</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #020205; font-family: sans-serif; outline: none; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        
+        #ui-container {
+            position: absolute; top: 20px; left: 20px;
+            color: rgba(255, 255, 255, 0.9);
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px; border-radius: 8px; pointer-events: none;
+            backdrop-filter: blur(4px); transition: all 0.3s;
+        }
+        h1 { margin: 0 0 5px 0; font-size: 1.2rem; color: #fff; }
+        p { margin: 0; font-size: 0.9rem; }
+        
+        #walk-prompt {
+            position: absolute; bottom: 50px; left: 50%; transform: translateX(-50%);
+            background: rgba(255, 255, 255, 0.9); color: black;
+            padding: 10px 20px; border-radius: 20px; font-weight: bold;
+            display: none; pointer-events: none; text-transform: uppercase;
+        }
+
+        #crosshair {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 4px; height: 4px; background: rgba(255, 255, 255, 0.5);
+            border-radius: 50%; display: none; pointer-events: none;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body tabindex="0">
+    <div id="ui-container">
+        <h1>Procedural Planet Gen</h1>
+        <p id="mode-text">Mode: Orbit</p>
+        <p style="margin-top: 10px; font-size: 0.8rem; color: #aaa;" id="instructions">Left Click: Rotate | Scroll: Zoom to Surface</p>
+        
+        <div style="margin-top: 15px; display: flex; gap: 5px; pointer-events: auto;">
+            <input type="text" id="seed-input" placeholder="Enter seed..." value="RedTeam" style="width: 120px; padding: 4px; border: none; border-radius: 4px; background: rgba(255,255,255,0.8);">
+            <button id="seed-btn" style="padding: 4px 8px; border: none; border-radius: 4px; background: #fff; cursor: pointer; font-weight: bold;">Generate</button>
+        </div>
+    </div>
+    
+    <div id="walk-prompt">Click to enter First-Person</div>
+    <div id="crosshair"></div>
+
+    <script>
+        // --- SCALE METRICS ---
+        const PLANET_RADIUS = 6000; 
+        const MAX_MOUNTAIN_HEIGHT = PLANET_RADIUS * 0.15; 
+        const MAX_LOD_LEVEL = 10; 
+
+        // --- SHARED SHADER LOGIC ---
+        const snoiseChunk = `
+            vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+            vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+            float snoise(vec3 v) {
+                const vec2  C = vec2(1.0/6.0, 1.0/3.0);
+                const vec4  D = vec4(0.0, 0.5, 1.0, 2.0);
+                vec3 i  = floor(v + dot(v, C.yyy));
+                vec3 x0 = v - i + dot(i, C.xxx);
+                vec3 g = step(x0.yzx, x0.xyz);
+                vec3 l = 1.0 - g;
+                vec3 i1 = min(g.xyz, l.zxy);
+                vec3 i2 = max(g.xyz, l.zxy);
+                vec3 x1 = x0 - i1 + C.xxx;
+                vec3 x2 = x0 - i2 + C.yyy;
+                vec3 x3 = x0 - D.yyy;
+                i = mod289(i); 
+                vec4 p = permute(permute(permute(i.z + vec4(0.0, i1.z, i2.z, 1.0)) + i.y + vec4(0.0, i1.y, i2.y, 1.0)) + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+                float n_ = 0.142857142857; vec3  ns = n_ * D.wyz - D.xzx;
+                vec4 j = p - 49.0 * floor(p * ns.z * ns.z); vec4 x_ = floor(j * ns.z); vec4 y_ = floor(j - 7.0 * x_);
+                vec4 x = x_ * ns.x + ns.yyyy; vec4 y = y_ * ns.x + ns.yyyy; vec4 h = 1.0 - abs(x) - abs(y);
+                vec4 b0 = vec4(x.xy, y.xy); vec4 b1 = vec4(x.zw, y.zw); vec4 s0 = floor(b0) * 2.0 + 1.0; vec4 s1 = floor(b1) * 2.0 + 1.0;
+                vec4 sh = -step(h, vec4(0.0)); vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy; vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+                vec3 p0 = vec3(a0.xy, h.x); vec3 p1 = vec3(a0.zw, h.y); vec3 p2 = vec3(a1.xy, h.z); vec3 p3 = vec3(a1.zw, h.w);
+                vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+                p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+                vec4 m = max(0.5 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0); m = m * m;
+                return 105.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+            }
+        `;
+
+        // --- ATMOSPHERIC SHADER SYSTEM ---
+        const atmosVertexShader = `
+            varying vec3 vNormal;
+            varying vec3 vPositionWorld;
+            void main() {
+                vNormal = normalize(normalMatrix * normal);
+                vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+                vPositionWorld = worldPosition.xyz;
+                gl_Position = projectionMatrix * viewMatrix * worldPosition;
+            }
+        `;
+
+        const atmosFragmentShader = `
+            varying vec3 vNormal;
+            varying vec3 vPositionWorld;
+            uniform vec3 u_sunDirection;
+            uniform float u_radius;
+
+            void main() {
+                // Vector from camera to fragment
+                vec3 viewDir = normalize(vPositionWorld - cameraPosition);
+                // Vector from planet center to fragment
+                vec3 planetNormal = normalize(vPositionWorld);
+                
+                // Day/Night and sunset masking
+                float sunLight = dot(planetNormal, u_sunDirection);
+                float dayMix = smoothstep(-0.2, 0.2, sunLight);
+                
+                // Atmospheric colors
+                vec3 zenithColor = vec3(0.02, 0.05, 0.15);
+                vec3 horizonColorDay = vec3(0.3, 0.6, 1.0);
+                vec3 horizonColorSunset = vec3(0.9, 0.4, 0.1);
+                
+                // Shift horizon color to sunset if near terminator line
+                vec3 horizonColor = mix(horizonColorSunset, horizonColorDay, smoothstep(-0.1, 0.3, sunLight));
+                
+                // Optical depth calculates the rim (grazing angles) vs zenith
+                float viewDot = abs(dot(viewDir, planetNormal)); 
+                float opticalDepth = pow(1.0 - viewDot, 4.0);
+                
+                // Base gradient
+                vec3 atmosColor = mix(zenithColor, horizonColor, opticalDepth);
+                
+                // Rayleigh/Mie sun scattering (sun glare in the sky)
+                float sunScatter = pow(max(dot(viewDir, u_sunDirection), 0.0), 20.0);
+                atmosColor += vec3(1.0, 0.9, 0.7) * sunScatter * dayMix;
+                
+                // Calculate altitude to fade the sky dome away dynamically as we breach orbit
+                float camAlt = max(length(cameraPosition) - u_radius, 0.0);
+                float atmosphereThickness = u_radius * 0.25; 
+                
+                // 1.0 when on the ground, 0.0 when deep in space
+                float groundRatio = 1.0 - clamp(camAlt / atmosphereThickness, 0.0, 1.0);
+                float baseAlpha = groundRatio * 0.9; // Blocks stars during the day when on ground
+                
+                // Opacity is high at the rim (opticalDepth), or high everywhere if on the ground (baseAlpha)
+                float alpha = max(opticalDepth, baseAlpha) * dayMix;
+                
+                // Add a very faint night-side rim to highlight the atmosphere silhouette
+                float nightRim = opticalDepth * 0.1 * (1.0 - dayMix);
+                alpha += nightRim;
+                
+                gl_FragColor = vec4(atmosColor, alpha);
+            }
+        `;
+
+        const coreProceduralMath = `
+            ${snoiseChunk}
+            
+            uniform vec3 u_seedOffset;
+
+            // --- TECTONIC WORLEY/VORONOI NOISE ---
+            vec3 hash33(vec3 p) {
+                p = vec3( dot(p,vec3(127.1,311.7, 74.7)),
+                          dot(p,vec3(269.5,183.3,246.1)),
+                          dot(p,vec3(113.5,271.9,124.6)));
+                return fract(sin(p)*43758.5453123);
+            }
+
+            vec2 voronoi(vec3 x) {
+                x += u_seedOffset; 
+                vec3 p = floor(x);
+                vec3 f = fract(x);
+                vec2 res = vec2(100.0);
+                for(int k=-1; k<=1; k++) {
+                    for(int j=-1; j<=1; j++) {
+                        for(int i=-1; i<=1; i++) {
+                            vec3 b = vec3(float(i), float(j), float(k));
+                            vec3 r = vec3(b) - f + hash33(p + b);
+                            float d = dot(r, r);
+                            if(d < res.x) { res.y = res.x; res.x = d; } 
+                            else if(d < res.y) { res.y = d; }
+                        }
+                    }
+                }
+                return sqrt(res);
+            }
+
+            float fbm_cheap(vec3 x) { x += u_seedOffset; float v = 0.0; float a = 0.5; vec3 shift = vec3(100.0); for (int i = 0; i < 2; ++i) { v += a * snoise(x); x = x * 2.0 + shift; a *= 0.5; } return v; }
+            float fbm_macro(vec3 x) { x += u_seedOffset; float v = 0.0; float a = 0.5; vec3 shift = vec3(100.0); for (int i = 0; i < 4; ++i) { v += a * snoise(x); x = x * 2.0 + shift; a *= 0.5; } return v; }
+            float fbm_micro(vec3 x) { x += u_seedOffset; float v = 0.0; float a = 0.5; vec3 shift = vec3(100.0); for (int i = 0; i < 8; ++i) { v += a * snoise(x); x = x * 2.0 + shift; a *= 0.5; } return v; }
+            
+            float fbm_ridged(vec3 x) { 
+                x += u_seedOffset;
+                float v = 0.0; float a = 0.5; vec3 shift = vec3(100.0); 
+                for (int i = 0; i < 6; ++i) { 
+                    float n = 1.0 - abs(snoise(x)); 
+                    v += a * (n * n); 
+                    x = x * 2.0 + shift; a *= 0.5; 
+                } return v; 
+            }
+
+            float fbm_canyon(vec3 x) { 
+                x += u_seedOffset;
+                float v = 0.0; float a = 0.5; vec3 shift = vec3(100.0); 
+                for (int i = 0; i < 4; ++i) { 
+                    float n = 1.0 - abs(snoise(x)); 
+                    v += a * pow(n, 4.0); 
+                    x = x * 2.0 + shift; a *= 0.5; 
+                } return v; 
+            }
+
+            // --- GEOLOGICAL MASKING ---
+            float getRawElevation(vec3 pos) {
+                vec3 warpOffset = vec3(fbm_macro(pos * 2.0), fbm_macro(pos * 2.0 + 10.0), fbm_macro(pos * 2.0 + 20.0));
+                vec3 warpedPos = pos + (warpOffset * 0.4);
+
+                vec2 vPlates = voronoi(warpedPos * 1.5);
+                float plateBoundary = vPlates.y - vPlates.x; 
+                float cellCenter = vPlates.x; 
+
+                float baseContinent = snoise((warpedPos * 1.0) + u_seedOffset) * 0.5 + 0.5;
+                baseContinent = mix(baseContinent, cellCenter, 0.4); 
+                float landMask = smoothstep(0.42, 0.52, baseContinent);
+
+                float mountainMask = 1.0 - smoothstep(0.0, 0.15, plateBoundary);
+                mountainMask *= smoothstep(0.3, 0.6, baseContinent) * smoothstep(-0.2, 0.5, snoise((warpedPos * 4.0) + u_seedOffset));
+                float peaks = fbm_ridged(warpedPos * 4.0) * 0.6; 
+
+                vec2 vCanyons = voronoi(warpedPos * 6.0);
+                float canyonBoundary = vCanyons.y - vCanyons.x;
+                float canyonMask = (1.0 - smoothstep(0.0, 0.03, canyonBoundary)) * landMask * (1.0 - mountainMask);
+                float canyonDepth = 0.08;
+
+                float plains = fbm_micro(warpedPos * 5.0) * 0.03;
+
+                float elevation = baseContinent * 0.12;     
+                elevation += landMask * 0.05;               
+                elevation += plains * landMask;             
+                elevation += mountainMask * peaks;          
+                elevation -= canyonMask * canyonDepth;      
+
+                return elevation;
+            }
+
+            float getSurfaceElevation(vec3 pos) {
+                return max(getRawElevation(pos), 0.08); 
+            }
+        `;
+
+        const vertexShader = `
+            ${coreProceduralMath}
+            uniform vec3 u_center; uniform vec3 u_axisA; uniform vec3 u_axisB; uniform float u_radius;
+            varying vec2 vClimate; varying float vElevation; varying vec3 vWorldPosition; 
+
+            void main() {
+                vec3 spherePos = normalize(u_center + (u_axisA * position.x) + (u_axisB * position.y)); 
+                float rawElev = getRawElevation(spherePos);
+                vElevation = rawElev;
+                float physicalElevation = getSurfaceElevation(spherePos);
+
+                float moisture = (fbm_cheap(spherePos * 3.0 + 50.0) + 1.0) * 0.5; 
+                float finalTemp = clamp((1.0 - abs(spherePos.y)) + (fbm_cheap(spherePos * 4.0) * 0.2) - (physicalElevation * 0.8), 0.0, 1.0);
+
+                vClimate = vec2(moisture, finalTemp);
+                
+                vec3 newPosition = spherePos * (u_radius + (physicalElevation * (u_radius * 0.15)));
+                vWorldPosition = newPosition; 
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(newPosition, 1.0);
+            }
+        `;
+
+        const fragmentShader = `
+            varying vec2 vClimate; varying float vElevation; varying vec3 vWorldPosition;
+            uniform vec3 u_sunDirection;
+            uniform float u_radius;
+            
+            void main() {
+                float seaLevel = 0.08; 
+
+                vec3 hotColor = mix(vec3(0.85, 0.75, 0.5), vec3(0.1, 0.35, 0.15), smoothstep(0.3, 0.7, vClimate.x)); 
+                vec3 temperateColor = mix(vec3(0.35, 0.55, 0.25), vec3(0.1, 0.35, 0.15), smoothstep(0.4, 0.6, vClimate.x));
+                vec3 snow = vec3(0.9, 0.95, 1.0);
+                
+                vec3 landColor = mix(snow, temperateColor, smoothstep(0.15, 0.4, vClimate.y));
+                landColor = mix(landColor, hotColor, smoothstep(0.6, 0.8, vClimate.y));
+
+                vec3 dx = dFdx(vWorldPosition);
+                vec3 dy = dFdy(vWorldPosition);
+                vec3 crossVec = cross(dx, dy);
+                float crossLen = length(crossVec);
+                
+                vec3 normal = crossLen > 0.00000001 ? (crossVec / crossLen) : normalize(vWorldPosition);
+
+                float slope = 1.0 - dot(normal, normalize(vWorldPosition));
+                vec3 darkRock = vec3(0.2, 0.2, 0.22);
+                vec3 lightRock = vec3(0.4, 0.4, 0.42);
+                
+                vec3 rockColor = mix(darkRock, lightRock, step(0.5, fract(vElevation * 60.0)));
+                float rockBlend = smoothstep(0.1, 0.35, slope); 
+                
+                landColor = mix(landColor, rockColor, rockBlend);
+                landColor = mix(landColor, snow, smoothstep(0.55, 0.7, vElevation));
+
+                vec3 deepWater = vec3(0.01, 0.08, 0.25);
+                vec3 shallowWater = vec3(0.05, 0.4, 0.7);
+                vec3 waterColor = mix(deepWater, shallowWater, smoothstep(0.03, seaLevel, vElevation));
+
+                vec3 coastColor = mix(vec3(0.85, 0.75, 0.5), landColor, smoothstep(seaLevel, seaLevel + 0.01, vElevation));
+                vec3 finalColor = mix(waterColor, coastColor, smoothstep(seaLevel - 0.001, seaLevel + 0.001, vElevation));
+
+                float diffuse = max(dot((vElevation < seaLevel - 0.005) ? normalize(vWorldPosition) : normal, u_sunDirection), 0.0);
+                
+                if (vElevation <= seaLevel + 0.001) {
+                    vec3 viewDir = normalize(cameraPosition - vWorldPosition);
+                    vec3 halfVector = normalize(u_sunDirection + viewDir);
+                    float specular = pow(max(dot(normal, halfVector), 0.0), 128.0) * 1.5;
+                    diffuse += specular;
+                }
+                
+                vec3 viewDirRaw = cameraPosition - vWorldPosition;
+                float viewDist = length(viewDirRaw);
+                vec3 normView = viewDist > 0.0001 ? (viewDirRaw / viewDist) : normalize(vWorldPosition);
+                float headlamp = max(dot(normal, normView), 0.0) * 0.15;
+                
+                float ambient = 0.15;
+                vec3 litColor = finalColor * (diffuse + ambient + headlamp);
+
+                // --- NEW SYNERGISTIC ATMOSPHERIC FOG SYSTEM ---
+                float sunLight = dot(normalize(vWorldPosition), u_sunDirection);
+                float dayMix = smoothstep(-0.2, 0.2, sunLight);
+                
+                // Colors matched perfectly to the sky dome shader
+                vec3 fogZenith = vec3(0.02, 0.05, 0.15);
+                vec3 fogHorizonDay = vec3(0.3, 0.6, 1.0);
+                vec3 fogHorizonSunset = vec3(0.9, 0.4, 0.1);
+                
+                vec3 fogHorizon = mix(fogHorizonSunset, fogHorizonDay, smoothstep(-0.1, 0.3, sunLight));
+                vec3 fogColor = mix(fogZenith, fogHorizon, 0.8); // Distant fog is mostly horizon colored
+                
+                // Add sun glare to the fog when looking towards the sun
+                vec3 viewDirOut = -normView; 
+                float sunScatter = pow(max(dot(viewDirOut, u_sunDirection), 0.0), 8.0);
+                fogColor += vec3(1.0, 0.8, 0.4) * sunScatter * dayMix;
+
+                // Dynamically thin the fog based on the camera's true altitude above sea level
+                float camAlt = max(length(cameraPosition) - u_radius, 0.0);
+                float atmosphereThickness = u_radius * 0.25;
+                
+                // Density drops from thick ground air to vacuum space
+                float density = mix(0.00015, 0.000005, clamp(camAlt / atmosphereThickness, 0.0, 1.0));
+                float fogFactor = exp(-density * viewDist);
+                fogFactor = clamp(fogFactor, 0.0, 1.0);
+                
+                // If in deep space, fade the mountains to true black instead of blue air
+                float spaceFade = clamp(1.0 - (camAlt / atmosphereThickness), 0.0, 1.0);
+                fogColor = mix(vec3(0.01, 0.015, 0.04), fogColor, spaceFade); 
+
+                gl_FragColor = vec4(mix(fogColor, litColor, fogFactor), 1.0);
+            }
+        `;
+
+        // --- GPU ELEVATION READER ---
+        const elevationScene = new THREE.Scene();
+        const elevationCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, -10, 10);
+        const elevationTarget = new THREE.WebGLRenderTarget(1, 1, { format: THREE.RGBAFormat, type: THREE.UnsignedByteType });
+        
+        const elevationMaterial = new THREE.ShaderMaterial({
+            vertexShader: `void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`, 
+            fragmentShader: `
+                ${coreProceduralMath}
+                uniform vec3 u_pos;
+                void main() {
+                    float elev = getSurfaceElevation(normalize(u_pos));
+                    float v = clamp((elev + 2.0) / 5.0, 0.0, 1.0);
+                    vec3 enc = vec3(1.0, 255.0, 65025.0) * v;
+                    enc = fract(enc);
+                    enc.xy -= enc.yz * (1.0/255.0);
+                    gl_FragColor = vec4(enc, 1.0);
+                }
+            `,
+            uniforms: { 
+                u_pos: { value: new THREE.Vector3() },
+                u_seedOffset: { value: new THREE.Vector3(0, 0, 0) } 
+            },
+            depthWrite: false, depthTest: false
+        });
+        const elevationQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), elevationMaterial);
+        elevationQuad.frustumCulled = false;
+        elevationScene.add(elevationQuad);
+
+        let lastGoodElev = 0.08; 
+        
+        function getExactElevationAt(normalizedPos, renderer) {
+            elevationMaterial.uniforms.u_pos.value.copy(normalizedPos);
+            const currentTarget = renderer.getRenderTarget();
+            renderer.setRenderTarget(elevationTarget);
+            renderer.clear(); 
+            renderer.render(elevationScene, elevationCamera);
+            
+            const buffer = new Uint8Array(4);
+            renderer.readRenderTargetPixels(elevationTarget, 0, 0, 1, 1, buffer);
+            renderer.setRenderTarget(currentTarget);
+            
+            if (buffer[0] === 0 && buffer[1] === 0 && buffer[2] === 0) return lastGoodElev; 
+            
+            let packedElev = buffer[0]/255 + buffer[1]/65025 + buffer[2]/16581375;
+            let elev = (packedElev * 5.0) - 2.0;
+            
+            if (!isNaN(elev) && elev > -1.0) lastGoodElev = elev;
+            return lastGoodElev;
+        }
+
+        // --- QUADTREE LOD ENGINE ---
+        const CHUNK_SEGMENTS = 64; 
+        const chunkGeometry = new THREE.PlaneGeometry(1, 1, CHUNK_SEGMENTS, CHUNK_SEGMENTS);
+        
+        class PlanetChunk {
+            constructor(scene, center, axisA, axisB, level, materialTemplate) {
+                this.scene = scene; this.center = center; this.axisA = axisA; this.axisB = axisB; this.level = level;
+                this.children = []; this.isSubdivided = false;
+
+                this.material = materialTemplate.clone();
+                this.material.uniforms.u_center.value = this.center;
+                this.material.uniforms.u_axisA.value = this.axisA;
+                this.material.uniforms.u_axisB.value = this.axisB;
+
+                this.mesh = new THREE.Mesh(chunkGeometry, this.material);
+                
+                this.mesh.frustumCulled = false; 
+
+                this.normalizedCenter = this.center.clone().normalize();
+                this.scene.add(this.mesh);
+            }
+
+            update(cameraPosition) {
+                const dot = this.normalizedCenter.dot(cameraPosition.clone().normalize());
+                const margin = Math.sin((Math.PI / 2) / Math.pow(2, this.level)) + 0.2; 
+                if (dot < -margin) {
+                    this.mesh.visible = false;
+                    if (this.isSubdivided) this.merge(); return;
+                }
+
+                const cameraRadius = cameraPosition.length();
+                const horizontalDistance = cameraPosition.clone().normalize().angleTo(this.normalizedCenter) * PLANET_RADIUS;
+                const altitudePenalty = Math.max(0, cameraRadius - (PLANET_RADIUS + MAX_MOUNTAIN_HEIGHT)); 
+                const effectiveDistance = Math.sqrt(horizontalDistance * horizontalDistance + altitudePenalty * altitudePenalty);
+                
+                const subdivisionThreshold = PLANET_RADIUS * (2.8 / Math.pow(1.85, this.level));
+
+                if (this.level < MAX_LOD_LEVEL && effectiveDistance < subdivisionThreshold) {
+                    if (!this.isSubdivided) this.subdivide();
+                    this.mesh.visible = false; 
+                    for (let child of this.children) child.update(cameraPosition);
+                } else {
+                    if (this.isSubdivided) this.merge();
+                    this.mesh.visible = true; 
+                }
+            }
+
+            subdivide() {
+                this.isSubdivided = true;
+                if (this.children.length === 0) {
+                    const hA = this.axisA.clone().multiplyScalar(0.5); const hB = this.axisB.clone().multiplyScalar(0.5);
+                    const qA = this.axisA.clone().multiplyScalar(0.25); const qB = this.axisB.clone().multiplyScalar(0.25);
+                    const centers = [
+                        this.center.clone().sub(qA).sub(qB), this.center.clone().add(qA).sub(qB),
+                        this.center.clone().sub(qA).add(qB), this.center.clone().add(qA).add(qB)
+                    ];
+                    for (let c of centers) this.children.push(new PlanetChunk(this.scene, c, hA, hB, this.level + 1, this.material));
+                } else {
+                    for (let child of this.children) child.mesh.visible = true;
+                }
+            }
+            merge() { 
+                this.isSubdivided = false; 
+                for (let child of this.children) { 
+                    child.mesh.visible = false; 
+                    if(child.isSubdivided) child.merge(); 
+                } 
+            }
+            
+            destroy() {
+                this.scene.remove(this.mesh);
+                this.mesh.material.dispose();
+                for (let child of this.children) child.destroy();
+            }
+        }
+
+        // --- APPLICATION LOGIC & SPHERICAL FPS ---
+        let scene, camera, renderer, controls;
+        let rootChunks = [];
+        
+        let isWalking = false;
+        let canWalk = false;
+        let camYaw = 0; let camPitch = 0;
+        
+        const keys = { forward: false, backward: false, left: false, right: false };
+
+        const sunDirection = new THREE.Vector3(1.0, 0.8, 0.5).normalize();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x020308); 
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.01, PLANET_RADIUS * 5);
+            camera.position.set(0, 0, PLANET_RADIUS * 2.5);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); 
+            document.body.appendChild(renderer.domElement);
+
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true; controls.dampingFactor = 0.05;
+            controls.maxDistance = PLANET_RADIUS * 4;
+
+            const sunGeom = new THREE.SphereGeometry(150, 32, 32);
+            const sunMat = new THREE.MeshBasicMaterial({color: 0xffeebb});
+            const sunMesh = new THREE.Mesh(sunGeom, sunMat);
+            sunMesh.position.copy(sunDirection).multiplyScalar(PLANET_RADIUS * 3.5);
+            scene.add(sunMesh);
+
+            // RED TEAM FIX: Insert physical Atmospheric Sky Dome
+            // Rendered mathematically inside-out (BackSide) so it forms a halo from space, and a dome from the ground
+            const atmosMaterial = new THREE.ShaderMaterial({
+                vertexShader: atmosVertexShader,
+                fragmentShader: atmosFragmentShader,
+                uniforms: { 
+                    u_sunDirection: { value: sunDirection },
+                    u_radius: { value: PLANET_RADIUS }
+                },
+                transparent: true,
+                side: THREE.BackSide,
+                depthWrite: false
+            });
+            // 25% larger than radius perfectly envelopes the highest mountains
+            const atmosMesh = new THREE.Mesh(new THREE.SphereGeometry(PLANET_RADIUS * 1.25, 64, 64), atmosMaterial);
+            scene.add(atmosMesh);
+
+            const baseMaterial = new THREE.ShaderMaterial({
+                vertexShader, fragmentShader, extensions: { derivatives: true },
+                side: THREE.DoubleSide, 
+                uniforms: { 
+                    u_center: { value: new THREE.Vector3() }, 
+                    u_axisA: { value: new THREE.Vector3() }, 
+                    u_axisB: { value: new THREE.Vector3() }, 
+                    u_radius: { value: PLANET_RADIUS },
+                    u_sunDirection: { value: sunDirection },
+                    u_seedOffset: { value: new THREE.Vector3(0, 0, 0) }
+                }
+            });
+
+            const faces = [
+                { c: new THREE.Vector3(0, 0, 1),  a: new THREE.Vector3(2, 0, 0),  b: new THREE.Vector3(0, 2, 0) },
+                { c: new THREE.Vector3(0, 0, -1), a: new THREE.Vector3(-2, 0, 0), b: new THREE.Vector3(0, 2, 0) },
+                { c: new THREE.Vector3(1, 0, 0),  a: new THREE.Vector3(0, 0, -2), b: new THREE.Vector3(0, 2, 0) },
+                { c: new THREE.Vector3(-1, 0, 0), a: new THREE.Vector3(0, 0, 2),  b: new THREE.Vector3(0, 2, 0) },
+                { c: new THREE.Vector3(0, 1, 0),  a: new THREE.Vector3(2, 0, 0),  b: new THREE.Vector3(0, 0, -2) },
+                { c: new THREE.Vector3(0, -1, 0), a: new THREE.Vector3(2, 0, 0),  b: new THREE.Vector3(0, 0, 2) } 
+            ];
+            
+            function generateNewPlanetSeed(seedStr) {
+                let hash = 0;
+                for (let i = 0; i < seedStr.length; i++) {
+                    hash = ((hash << 5) - hash) + seedStr.charCodeAt(i);
+                    hash = hash & hash;
+                }
+                
+                const rand = (h) => (Math.sin(h) * 10000) % 100; 
+                const offset = new THREE.Vector3(rand(hash), rand(hash + 1), rand(hash + 2));
+
+                baseMaterial.uniforms.u_seedOffset.value.copy(offset);
+                elevationMaterial.uniforms.u_seedOffset.value.copy(offset);
+
+                for (let chunk of rootChunks) chunk.destroy();
+                rootChunks = [];
+                
+                lastGoodElev = 0.08; 
+                
+                for (let face of faces) {
+                    rootChunks.push(new PlanetChunk(scene, face.c, face.a, face.b, 0, baseMaterial));
+                }
+            }
+
+            document.getElementById('seed-btn').addEventListener('click', (e) => {
+                e.stopPropagation(); 
+                const seedStr = document.getElementById('seed-input').value || 'RedTeam';
+                generateNewPlanetSeed(seedStr);
+            });
+            
+            document.getElementById('seed-input').addEventListener('click', (e) => e.stopPropagation());
+
+            generateNewPlanetSeed('RedTeam');
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+
+            const setKey = (e, isDown) => {
+                if (!isWalking) return;
+                const code = e.code;
+                if (code === 'KeyW' || code === 'ArrowUp') keys.forward = isDown;
+                if (code === 'KeyS' || code === 'ArrowDown') keys.backward = isDown;
+                if (code === 'KeyA' || code === 'ArrowLeft') keys.left = isDown;
+                if (code === 'KeyD' || code === 'ArrowRight') keys.right = isDown;
+            };
+
+            document.addEventListener('keydown', (e) => setKey(e, true));
+            document.addEventListener('keyup', (e) => setKey(e, false));
+
+            document.addEventListener('mousemove', (e) => {
+                if (!isWalking || document.pointerLockElement !== document.body) return;
+                camYaw -= e.movementX * 0.002;
+                camPitch -= e.movementY * 0.002;
+                camPitch = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, camPitch));
+            });
+            
+            document.addEventListener('click', (e) => {
+                if(e.target.id === 'seed-input' || e.target.id === 'seed-btn') return;
+                
+                window.focus();
+                document.body.focus();
+                if (canWalk && !isWalking) document.body.requestPointerLock();
+            });
+            
+            document.addEventListener('pointerlockchange', () => {
+                if (document.pointerLockElement === document.body) {
+                    isWalking = true; controls.enabled = false;
+                    document.getElementById('mode-text').innerText = "Mode: First-Person Walking";
+                    document.getElementById('instructions').innerText = "WASD/Arrows to Move | ESC to Return to Orbit";
+                    document.getElementById('walk-prompt').style.display = 'none';
+                    document.getElementById('crosshair').style.display = 'block';
+                    camYaw = 0; camPitch = 0; 
+                } else {
+                    isWalking = false; controls.enabled = true;
+                    document.getElementById('mode-text').innerText = "Mode: Orbit";
+                    document.getElementById('instructions').innerText = "Left Click: Rotate | Scroll: Zoom to Surface";
+                    document.getElementById('crosshair').style.display = 'none';
+                    keys.forward = false; keys.backward = false; keys.left = false; keys.right = false;
+                    camera.position.multiplyScalar(1.05); 
+                }
+            });
+
+            animate();
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (!isWalking) {
+                controls.update();
+                const camNormal = camera.position.clone().normalize();
+                const elev = getExactElevationAt(camNormal, renderer);
+                const groundRadius = PLANET_RADIUS + (elev * MAX_MOUNTAIN_HEIGHT);
+                
+                controls.minDistance = groundRadius + 2.0; 
+                
+                if (camera.position.length() - groundRadius < 20.0) {
+                    canWalk = true; document.getElementById('walk-prompt').style.display = 'block';
+                } else {
+                    canWalk = false; document.getElementById('walk-prompt').style.display = 'none';
+                }
+            } else {
+                const upVec = camera.position.clone().normalize();
+                if (Math.abs(upVec.y + 1.0) < 0.001) upVec.z += 0.001;
+                upVec.normalize();
+
+                const alignQuat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), upVec);
+                const yawQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), camYaw);
+                const pitchQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), camPitch);
+                
+                camera.quaternion.copy(alignQuat).multiply(yawQuat).multiply(pitchQuat);
+
+                const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+                const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+
+                forward.sub(upVec.clone().multiplyScalar(forward.dot(upVec))).normalize();
+                right.sub(upVec.clone().multiplyScalar(right.dot(upVec))).normalize();
+
+                const moveVec = new THREE.Vector3();
+                if (keys.forward) moveVec.add(forward);
+                if (keys.backward) moveVec.sub(forward);
+                if (keys.right) moveVec.add(right);
+                if (keys.left) moveVec.sub(right);
+                
+                if (moveVec.lengthSq() > 0) {
+                    moveVec.normalize();
+                    camera.position.add(moveVec.multiplyScalar(1.0)); 
+                }
+
+                const newNormal = camera.position.clone().normalize();
+                const currentElev = getExactElevationAt(newNormal, renderer);
+                const exactGroundRadius = PLANET_RADIUS + (currentElev * MAX_MOUNTAIN_HEIGHT);
+                
+                const targetRadius = exactGroundRadius + 2.0;
+                const currentRadius = camera.position.length();
+                const smoothedRadius = currentRadius + (targetRadius - currentRadius) * 0.15;
+
+                camera.position.copy(newNormal.multiplyScalar(smoothedRadius)); 
+            }
+
+            for (let chunk of rootChunks) chunk.update(camera.position);
+
+            renderer.render(scene, camera);
+        }
+
+        window.onload = init;
+    </script>
+</body>
+</html>
