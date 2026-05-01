@@ -651,9 +651,10 @@ function generateSystems(seedStr){
             terrainParam: type.terrainParam*(0.85+prng()*.30),
         });
         const seedOff=new THREE.Vector3(prng()*200-100,prng()*200-100,prng()*200-100);
-        const orbitR=(1+planetIdx)*800_000*(0.6+prng()*.8);
+        const orbitR=(1+planetIdx)*100_000*(0.5+prng()*.8);
         const orbitA=prng()*Math.PI*2;
-        const pos=sysPos.clone().add(new THREE.Vector3(Math.cos(orbitA)*orbitR,0,Math.sin(orbitA)*orbitR));
+        const orbitY=(prng()-0.5)*orbitR*0.5;
+        const pos=sysPos.clone().add(new THREE.Vector3(Math.cos(orbitA)*orbitR, orbitY, Math.sin(orbitA)*orbitR));
         const dotH=t.dotHSL[0]+(prng()-.5)*.12;
         const c=new THREE.Color().setHSL(((dotH%1)+1)%1, t.dotHSL[1], t.dotHSL[2]);
         const name=generatePlanetName(sysName,planetIdx,prng);
@@ -681,8 +682,9 @@ function generateSystems(seedStr){
         const baseAngle=arm*(Math.PI*.5);
         const spiralTwist=(r/NEW_GALAXY_RADIUS)*Math.PI*.8;
         const angle=baseAngle+spiralTwist+(rng()-.5)*.6;
+        const phi2=Math.acos(2*rng()-1);
         clusters.push({
-            pos:new THREE.Vector3(r*Math.cos(angle),(rng()-.5)*r*.18,r*Math.sin(angle)),
+            pos:new THREE.Vector3(r*Math.cos(angle), r*Math.cos(phi2)*0.7, r*Math.sin(angle)),
             spread:500_000+rng()*1_500_000,
             count:10+Math.floor(rng()*28)
         });
@@ -697,7 +699,7 @@ function generateSystems(seedStr){
             const r=cl.spread*Math.sqrt(-2*Math.log(u));
             const theta=v*Math.PI*2;
             const phi=Math.acos(2*rng()-1);
-            const offset=new THREE.Vector3(r*Math.sin(phi)*Math.cos(theta),r*Math.sin(phi)*Math.sin(theta)*.25,r*Math.cos(phi));
+            const offset=new THREE.Vector3(r*Math.sin(phi)*Math.cos(theta),r*Math.sin(phi)*Math.sin(theta),r*Math.cos(phi));
             const pos=cl.pos.clone().add(offset);
             if(pos.length()>NEW_GALAXY_RADIUS*1.1) continue;
             let ok=true;
@@ -718,7 +720,7 @@ function generateSystems(seedStr){
         attempts++;
         const theta=rng()*Math.PI*2,phi=Math.acos(2*rng()-1);
         const r=Math.pow(rng(),1.6)*NEW_GALAXY_RADIUS;
-        const pos=new THREE.Vector3(r*Math.sin(phi)*Math.cos(theta),(rng()-.5)*r*.15,r*Math.cos(phi));
+        const pos=new THREE.Vector3(r*Math.sin(phi)*Math.cos(theta),r*Math.sin(phi)*Math.sin(theta),r*Math.cos(phi));
         let ok=true;
         for(const s of systems) if(pos.distanceTo(s.position)<MIN_SYS_SPACING*1.5){ok=false;break;}
         if(!ok) continue;
@@ -745,22 +747,18 @@ const CUBE_FACES=[
 ];
 
 let scene, camera, renderer, controls;
-let galaxySystems=[], focusedSysIdx=0, focusedPlIdx=0, rootChunks=[];
-let atmosMesh, cloudMesh, systemDotGeom, systemDotMat, planetDotGeom, planetDotMat;
-let systemDotPoints, planetDotPoints;
+let galaxySystems=[], allPlanetsFlat=[], focusedSysIdx=0, focusedPlIdx=0, rootChunks=[];
+let atmosMesh, cloudMesh, dotGeom, dotMat, dotPoints;
 let baseMaterial, atmosMat, cloudMatRef;
 let sharedU;
 let activePlanetRadius=BASE_RADIUS;
 let transitioning=false, transitionT=0;
 let transitionStartCam, transitionEndCam, transitionStartTgt, transitionEndTgt;
 let isWalking=false, canWalk=false, camYaw=0, camPitch=0;
-let systemView=false;
 const keys={};
 const sunDir=new THREE.Vector3(1,.8,.5).normalize();
 const _proj=new THREE.Vector3();
 
-// flat list of all planets for legacy click detection
-function allPlanets(){ return galaxySystems.flatMap(s=>s.planets); }
 function focusedPlanet(){ return (galaxySystems[focusedSysIdx]||{planets:[]}).planets[focusedPlIdx]; }
 
 // ─── FOCUS PLANET ─────────────────────────────────────────────────────────────
@@ -826,8 +824,20 @@ function focusPlanet(sysIdx, plIdx, immediate=false){
     for(const f of CUBE_FACES)
         rootChunks.push(new PlanetChunk(scene,f.c,f.a,f.b,0,baseMaterial,sharedU));
 
-    // Update planet sub-dots: hide focused planet, show others in system
-    if(window._updatePlanetDots) window._updatePlanetDots(sysIdx, plIdx);
+    // Hide focused planet dot, show all others
+    if(dotGeom){
+        const col=dotGeom.attributes.color.array;
+        const siz=dotGeom.attributes.size.array;
+        allPlanetsFlat.forEach((entry,i)=>{
+            const hide=(entry.sysIdx===sysIdx&&entry.plIdx===plIdx);
+            col[i*3]=hide?0:entry.planet.color.r;
+            col[i*3+1]=hide?0:entry.planet.color.g;
+            col[i*3+2]=hide?0:entry.planet.color.b;
+            siz[i]=hide?0:entry.planet.dotSize;
+        });
+        dotGeom.attributes.color.needsUpdate=true;
+        dotGeom.attributes.size.needsUpdate=true;
+    }
 
     if(!immediate){
         const vd=camera.position.clone().sub(controls.target).normalize();
@@ -845,7 +855,7 @@ function focusPlanet(sysIdx, plIdx, immediate=false){
     document.getElementById('system-text').textContent=`System: ${sys.name} (${sys.starClass.name}-class)`;
     document.getElementById('planet-text').textContent=`Planet: ${pl.name}`;
     document.getElementById('planet-type-text').textContent=`Type: ${pl.typeName}`;
-    document.getElementById('planet-nav-text').textContent=`← → to cycle ${sys.planets.length} planets`;
+    document.getElementById('planet-nav-text').textContent=`← → cycle ${sys.planets.length} planets in ${sys.name}`;
     if(t.walkable===false){
         canWalk=false; document.getElementById('walk-prompt').style.display='none';
     }
@@ -964,68 +974,41 @@ function init(){
         }
     });
 
-    // Shared dot shader
-    const DOT_VERT=`attribute float size; attribute vec3 color; varying vec3 vC;
-        void main(){ vC=color; gl_PointSize=size; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`;
-    const DOT_FRAG=`varying vec3 vC;
-        void main(){ vec2 uv=gl_PointCoord-.5; float r=length(uv); if(r>.5)discard; gl_FragColor=vec4(vC,1.-smoothstep(.2,.5,r));}`;
-
-    // System dots (500, always visible)
-    systemDotGeom=new THREE.BufferGeometry();
-    systemDotGeom.setAttribute('position',new THREE.BufferAttribute(new Float32Array(NUM_SYSTEMS*3),3));
-    systemDotGeom.setAttribute('color',   new THREE.BufferAttribute(new Float32Array(NUM_SYSTEMS*3),3));
-    systemDotGeom.setAttribute('size',    new THREE.BufferAttribute(new Float32Array(NUM_SYSTEMS),1));
-    systemDotMat=new THREE.ShaderMaterial({transparent:true,depthWrite:false,vertexShader:DOT_VERT,fragmentShader:DOT_FRAG});
-    systemDotPoints=new THREE.Points(systemDotGeom,systemDotMat);
-    scene.add(systemDotPoints);
-
-    // Planet sub-dots (up to 3000 = 500 sys × 6 planets max)
-    const MAX_PLANET_DOTS=3000;
-    planetDotGeom=new THREE.BufferGeometry();
-    planetDotGeom.setAttribute('position',new THREE.BufferAttribute(new Float32Array(MAX_PLANET_DOTS*3),3));
-    planetDotGeom.setAttribute('color',   new THREE.BufferAttribute(new Float32Array(MAX_PLANET_DOTS*3),3));
-    planetDotGeom.setAttribute('size',    new THREE.BufferAttribute(new Float32Array(MAX_PLANET_DOTS),1));
-    planetDotMat=new THREE.ShaderMaterial({transparent:true,depthWrite:false,vertexShader:DOT_VERT,fragmentShader:DOT_FRAG});
-    planetDotPoints=new THREE.Points(planetDotGeom,planetDotMat);
-    planetDotPoints.visible=false;
-    scene.add(planetDotPoints);
-
-    function updatePlanetDots(sysIdx, focusPlIdx){
-        const sys=galaxySystems[sysIdx];
-        const pos=planetDotGeom.attributes.position.array;
-        const col=planetDotGeom.attributes.color.array;
-        const siz=planetDotGeom.attributes.size.array;
-        pos.fill(1e9); col.fill(0); siz.fill(0);
-        if(sys){
-            sys.planets.forEach((p,i)=>{
-                const hide=(i===focusPlIdx);
-                pos[i*3]=p.position.x; pos[i*3+1]=p.position.y; pos[i*3+2]=p.position.z;
-                col[i*3]=hide?0:p.color.r; col[i*3+1]=hide?0:p.color.g; col[i*3+2]=hide?0:p.color.b;
-                siz[i]=hide?0:p.dotSize*2;
-            });
-        }
-        planetDotGeom.attributes.position.needsUpdate=true;
-        planetDotGeom.attributes.color.needsUpdate=true;
-        planetDotGeom.attributes.size.needsUpdate=true;
-    }
-
-    // Expose updatePlanetDots to focusPlanet scope
-    window._updatePlanetDots=updatePlanetDots;
+    // Single flat dot geometry for all planets
+    const MAX_DOTS=3000;
+    dotGeom=new THREE.BufferGeometry();
+    dotGeom.setAttribute('position',new THREE.BufferAttribute(new Float32Array(MAX_DOTS*3),3));
+    dotGeom.setAttribute('color',   new THREE.BufferAttribute(new Float32Array(MAX_DOTS*3),3));
+    dotGeom.setAttribute('size',    new THREE.BufferAttribute(new Float32Array(MAX_DOTS),1));
+    dotMat=new THREE.ShaderMaterial({
+        transparent:true, depthWrite:false,
+        vertexShader:`attribute float size; attribute vec3 color; varying vec3 vC;
+            void main(){ vC=color; gl_PointSize=size; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
+        fragmentShader:`varying vec3 vC;
+            void main(){ vec2 uv=gl_PointCoord-.5; float r=length(uv); if(r>.5)discard; gl_FragColor=vec4(vC,1.-smoothstep(.2,.5,r));}`
+    });
+    dotPoints=new THREE.Points(dotGeom,dotMat);
+    scene.add(dotPoints);
 
     function buildGalaxy(seedStr){
         galaxySystems=generateSystems(seedStr);
-        const pos=systemDotGeom.attributes.position.array;
-        const col=systemDotGeom.attributes.color.array;
-        const siz=systemDotGeom.attributes.size.array;
-        galaxySystems.forEach((sys,i)=>{
-            pos[i*3]=sys.position.x; pos[i*3+1]=sys.position.y; pos[i*3+2]=sys.position.z;
-            col[i*3]=sys.color.r;    col[i*3+1]=sys.color.g;    col[i*3+2]=sys.color.b;
-            siz[i]=sys.dotSize;
+        // Flatten all planets into a single indexed list
+        allPlanetsFlat=[];
+        galaxySystems.forEach((sys,si)=>sys.planets.forEach((pl,pi)=>allPlanetsFlat.push({sysIdx:si,plIdx:pi,planet:pl})));
+
+        const pos=dotGeom.attributes.position.array;
+        const col=dotGeom.attributes.color.array;
+        const siz=dotGeom.attributes.size.array;
+        pos.fill(1e9); col.fill(0); siz.fill(0);
+        allPlanetsFlat.forEach((entry,i)=>{
+            const p=entry.planet;
+            pos[i*3]=p.position.x; pos[i*3+1]=p.position.y; pos[i*3+2]=p.position.z;
+            col[i*3]=p.color.r; col[i*3+1]=p.color.g; col[i*3+2]=p.color.b;
+            siz[i]=p.dotSize;
         });
-        systemDotGeom.attributes.position.needsUpdate=true;
-        systemDotGeom.attributes.color.needsUpdate=true;
-        systemDotGeom.attributes.size.needsUpdate=true;
-        systemView=false; planetDotPoints.visible=false;
+        dotGeom.attributes.position.needsUpdate=true;
+        dotGeom.attributes.color.needsUpdate=true;
+        dotGeom.attributes.size.needsUpdate=true;
         focusPlanet(0,0,true);
     }
 
@@ -1036,48 +1019,21 @@ function init(){
     document.getElementById('seed-input').addEventListener('click',e=>e.stopPropagation());
     buildGalaxy('RedTeam');
 
-    // Click — travel to system or planet or enter walk mode
+    // Click — travel directly to any planet dot, or enter walk mode
     renderer.domElement.addEventListener('click',e=>{
         if(isWalking||transitioning) return;
         if(e.target.id==='seed-input'||e.target.id==='seed-btn') return;
         const cx=e.clientX, cy=e.clientY;
-
-        if(systemView){
-            // In system view: click a planet sub-dot
-            const sys=galaxySystems[focusedSysIdx];
-            if(sys){
-                let bestI=-1, bestD=20*20;
-                sys.planets.forEach((p,i)=>{
-                    if(i===focusedPlIdx) return;
-                    _proj.copy(p.position).project(camera);
-                    if(_proj.z>1) return;
-                    const sx=(_proj.x*.5+.5)*innerWidth, sy=(-.5*_proj.y+.5)*innerHeight;
-                    const d=(sx-cx)**2+(sy-cy)**2;
-                    if(d<bestD){bestD=d;bestI=i;}
-                });
-                if(bestI>=0){focusPlanet(focusedSysIdx,bestI);return;}
-            }
-        }
-
-        // Galaxy view: click a system dot
-        let bestSys=-1, bestD=20*20;
-        for(let i=0;i<galaxySystems.length;i++){
-            if(i===focusedSysIdx&&systemView) continue;
-            _proj.copy(galaxySystems[i].position).project(camera);
-            if(_proj.z>1) continue;
+        let bestI=-1, bestD=20*20;
+        allPlanetsFlat.forEach((entry,i)=>{
+            if(entry.sysIdx===focusedSysIdx&&entry.plIdx===focusedPlIdx) return;
+            _proj.copy(entry.planet.position).project(camera);
+            if(_proj.z>1) return;
             const sx=(_proj.x*.5+.5)*innerWidth, sy=(-.5*_proj.y+.5)*innerHeight;
             const d=(sx-cx)**2+(sy-cy)**2;
-            if(d<bestD){bestD=d;bestSys=i;}
-        }
-        if(bestSys>=0){
-            focusedSysIdx=bestSys; systemView=true; planetDotPoints.visible=true;
-            // hide clicked system dot
-            const siz=systemDotGeom.attributes.size.array;
-            siz.fill(0,bestSys,bestSys+1);
-            systemDotGeom.attributes.size.needsUpdate=true;
-            focusPlanet(bestSys,0);
-            return;
-        }
+            if(d<bestD){bestD=d;bestI=i;}
+        });
+        if(bestI>=0){ const e2=allPlanetsFlat[bestI]; focusPlanet(e2.sysIdx,e2.plIdx); return; }
         if(canWalk) document.body.requestPointerLock();
     });
 
@@ -1094,7 +1050,7 @@ function init(){
     };
     document.addEventListener('keydown',e=>{
         setKey(e,true);
-        if(!isWalking&&systemView){
+        if(!isWalking&&!transitioning){
             const sys=galaxySystems[focusedSysIdx];
             if(!sys) return;
             const n=sys.planets.length;
