@@ -327,6 +327,7 @@ void main(){
 
 // ─── PLANET TERRAIN FRAGMENT SHADER ───────────────────────────────────────────
 const FRAG = `
+${SNOISE}
 varying vec2 vClimate; varying float vElevation;
 varying vec3 vWorldPosition; varying vec3 vLocalPos; varying vec3 vPlanetNormal;
 varying float vRockVar; varying float vGroundVar;
