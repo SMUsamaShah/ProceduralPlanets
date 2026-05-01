@@ -51,6 +51,7 @@ float snoise(vec3 v){
 const CORE_MATH = `
 ${SNOISE}
 uniform vec3  u_seedOffset;
+uniform float u_waterLevel;
 uniform float u_terrainMode;
 uniform float u_terrainParam;
 uniform float u_terrainParam2;
@@ -235,7 +236,7 @@ float getRawElevation(vec3 pos) {
     return base * 0.4 + crystalSpires(pos, u_terrainParam, u_terrainParam2);
 }
 
-float getSurfaceElevation(vec3 pos){ return max(getRawElevation(pos), 0.08); }
+float getSurfaceElevation(vec3 pos){ return max(getRawElevation(pos), u_waterLevel); }
 `;
 
 // ─── ATMOSPHERE SHADERS ───────────────────────────────────────────────────────
@@ -293,7 +294,7 @@ const VERT = `
 ${CORE_MATH}
 uniform vec3 u_center; uniform vec3 u_axisA; uniform vec3 u_axisB;
 uniform float u_radius; uniform vec3 u_planetCenter;
-uniform float u_waterLevel; uniform float u_erosionStr;
+uniform float u_erosionStr;
 varying vec2 vClimate; varying float vElevation;
 varying vec3 vWorldPosition; varying vec3 vLocalPos; varying vec3 vPlanetNormal;
 varying vec3 vNormal;
@@ -465,6 +466,7 @@ const elevMat    = new THREE.ShaderMaterial({
     uniforms:{
         u_pos:{value:new THREE.Vector3()},
         u_seedOffset:{value:new THREE.Vector3()},
+        u_waterLevel:{value:0.09},
         u_terrainMode:{value:0.0},
         u_terrainParam:{value:3.0},
         u_terrainParam2:{value:0.15}
@@ -798,7 +800,7 @@ function focusPlanet(sysIdx, plIdx, immediate=false){
 
     // Destroy current LOD
     for(const c of rootChunks) c.destroy();
-    rootChunks=[]; lastGoodElev=.08;
+    rootChunks=[]; lastGoodElev=pl.type.waterLevel;
 
     const t=pl.type;
     activePlanetRadius=pl.radius;
@@ -828,8 +830,9 @@ function focusPlanet(sysIdx, plIdx, immediate=false){
     sharedU.emissiveColor.value.set(...(t.emissiveColor||[0,0,0]));
     sharedU.emissiveStr.value=t.emissiveStr||0;
 
-    // Elevation reader seed + terrain mode
+    // Elevation reader seed + terrain mode (must match VERT shader exactly)
     elevMat.uniforms.u_seedOffset.value.copy(pl.seedOffset);
+    elevMat.uniforms.u_waterLevel.value=t.waterLevel;
     elevMat.uniforms.u_terrainMode.value=t.terrainMode||0;
     elevMat.uniforms.u_terrainParam.value=t.terrainParam||3.0;
     elevMat.uniforms.u_terrainParam2.value=t.terrainParam2||0.15;
