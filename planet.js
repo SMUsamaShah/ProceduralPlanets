@@ -296,18 +296,12 @@ uniform float u_radius; uniform vec3 u_planetCenter;
 uniform float u_waterLevel; uniform float u_erosionStr;
 varying vec2 vClimate; varying float vElevation;
 varying vec3 vWorldPosition; varying vec3 vLocalPos; varying vec3 vPlanetNormal;
+varying vec3 vNormal;
 varying float vRockVar; varying float vGroundVar;
 
 void main(){
     vec3 sp = normalize(u_center + u_axisA*position.x + u_axisB*position.y);
-
-    // LOD seam fix: blend toward smooth single-octave base near chunk edges so
-    // adjacent chunks at different LOD levels agree at their shared boundary.
-    float _ex = min(position.x + 0.5, 0.5 - position.x);
-    float _ey = min(position.y + 0.5, 0.5 - position.y);
-    float edgeFade = smoothstep(0.0, 0.10, min(_ex, _ey));
-    float rawCoarse = snoise(sp * 2.0 + u_seedOffset) * 0.06 + 0.09;
-    float raw = mix(rawCoarse, getRawElevation(sp), edgeFade);
+    float raw = getRawElevation(sp);
 
     // Erosion: two octaves of gradient-aligned gully displacement
     float g1 = erosionOctave(sp, 5.5);
@@ -327,8 +321,18 @@ void main(){
 
     float physElev = max(erodedElev, u_waterLevel);
     vec3 localPos = sp*(u_radius + physElev*u_radius*0.08);
-    // Skirt: pull inner skirt vertices below the surface to hide LOD seam cracks
-    if (position.z < -0.5) { localPos -= sp * u_radius * 0.12; }
+
+    // Smooth vertex normal: sample terrain at two neighbouring sphere points so
+    // interpolated normals eliminate the flat-shaded facet look in walk mode.
+    float nEps = 0.004;
+    vec3 tanA = normalize(u_axisA);
+    vec3 tanB = normalize(u_axisB);
+    float hA = max(getRawElevation(normalize(sp + tanA * nEps)), u_waterLevel);
+    float hB = max(getRawElevation(normalize(sp + tanB * nEps)), u_waterLevel);
+    vec3 pA = normalize(sp + tanA * nEps) * (u_radius + hA * u_radius * 0.08) - localPos;
+    vec3 pB = normalize(sp + tanB * nEps) * (u_radius + hB * u_radius * 0.08) - localPos;
+    vNormal = normalize(cross(pA, pB));
+
     vLocalPos = localPos;
     vWorldPosition = localPos + u_planetCenter;
     gl_Position = projectionMatrix*viewMatrix*vec4(vWorldPosition,1.);
@@ -339,6 +343,7 @@ const FRAG = `
 ${SNOISE}
 varying vec2 vClimate; varying float vElevation;
 varying vec3 vWorldPosition; varying vec3 vLocalPos; varying vec3 vPlanetNormal;
+varying vec3 vNormal;
 varying float vRockVar; varying float vGroundVar;
 uniform vec3 u_sunDir; uniform float u_radius; uniform vec3 u_planetCenter;
 uniform float u_waterLevel;
@@ -392,10 +397,8 @@ void main(){
         landColor += u_emissiveColor * bioPatch * 0.8;
     }
 
-    // Slope normals (use local-space for float precision at large planet positions)
-    vec3 dx=dFdx(vLocalPos); vec3 dy=dFdy(vLocalPos);
-    vec3 xvec=cross(dx,dy); float xl=length(xvec);
-    vec3 normal = xl>1e-8 ? xvec/xl : vPlanetNormal;
+    // Smooth interpolated vertex normal (computed in VERT from terrain gradient)
+    vec3 normal = normalize(vNormal);
     float slope = 1.-dot(normal, vPlanetNormal);
 
     // Rock on steep faces — colour varies by climate (warm rock in hot zones)
@@ -488,18 +491,10 @@ function getElevAt(nPos, renderer){
 }
 
 // ─── QUADTREE LOD ─────────────────────────────────────────────────────────────
-// Chunk geometry with skirt strips on all 4 edges.
-// Skirt inner vertices have position.z = -1; the vertex shader pulls them
-// inward by ~5% of planet radius, hiding cracks between adjacent LOD levels.
 function buildChunkGeom(N) {
     const NP1 = N + 1;
-    const mainN = NP1 * NP1;
-    // Skirt: only INNER vertices (4 × NP1). Outer row reuses main-grid edge indices.
-    // This eliminates z-fighting between skirt and main terrain entirely.
-    const verts = new Float32Array((mainN + 4 * NP1) * 3);
+    const verts = new Float32Array(NP1 * NP1 * 3);
     const idx = [];
-
-    // Main grid: x,y in [-0.5,0.5], z=0
     for (let j = 0; j <= N; j++) for (let i = 0; i <= N; i++) {
         const v = (j * NP1 + i) * 3;
         verts[v] = i/N - 0.5; verts[v+1] = j/N - 0.5; verts[v+2] = 0;
@@ -508,27 +503,6 @@ function buildChunkGeom(N) {
         const a=j*NP1+i, b=a+1, c=a+NP1, d=c+1;
         idx.push(a,b,c, b,d,c);
     }
-
-    // Skirt inner vertices only (z=-1 → VERT shader pulls them below surface)
-    let sb = mainN;
-    function inner(x, y) { verts[sb*3]=x; verts[sb*3+1]=y; verts[sb*3+2]=-1; return sb++; }
-
-    // Bottom (j=0): outer = grid[i]
-    { const s=[]; for(let i=0;i<=N;i++) s.push(inner(i/N-0.5,-0.5));
-      for(let i=0;i<N;i++) idx.push(i,s[i],i+1, i+1,s[i],s[i+1]); }
-
-    // Top (j=N): outer = grid[N*NP1+i]
-    { const s=[]; for(let i=0;i<=N;i++) s.push(inner(i/N-0.5,0.5));
-      for(let i=0;i<N;i++){const o=N*NP1+i; idx.push(o,o+1,s[i], o+1,s[i+1],s[i]);} }
-
-    // Left (i=0): outer = grid[j*NP1]
-    { const s=[]; for(let j=0;j<=N;j++) s.push(inner(-0.5,j/N-0.5));
-      for(let j=0;j<N;j++){const o=j*NP1; idx.push(o,(j+1)*NP1,s[j], (j+1)*NP1,s[j+1],s[j]);} }
-
-    // Right (i=N): outer = grid[j*NP1+N]
-    { const s=[]; for(let j=0;j<=N;j++) s.push(inner(0.5,j/N-0.5));
-      for(let j=0;j<N;j++){const o=j*NP1+N; idx.push(o,s[j],(j+1)*NP1+N, (j+1)*NP1+N,s[j],s[j+1]);} }
-
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(verts, 3));
     g.setIndex(new THREE.BufferAttribute(new Uint32Array(idx), 1));
