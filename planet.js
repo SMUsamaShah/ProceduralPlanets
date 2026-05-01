@@ -426,8 +426,8 @@ void main(){
     }
     vec3 vdr=cameraPosition-vWorldPosition; float vdist=length(vdr);
     vec3 nv=vdist>.0001?vdr/vdist:vPlanetNormal;
-    float headlamp=max(dot(normal,nv),0.)*.12;
-    vec3 litColor=finalColor*(diffuse+.14+headlamp);
+    float headlamp=max(dot(normal,nv),0.)*.15;
+    vec3 litColor=finalColor*(diffuse+.18+headlamp);
     litColor += u_emissiveColor * u_emissiveStr * (vElevation < u_waterLevel + 0.05 ? 1.0 : 0.0);
 
     // Atmospheric fog — zenith/horizon from planet type
@@ -970,7 +970,7 @@ function init(){
     // Base material (shared with all chunks; type-specific uniforms added from sharedU)
     baseMaterial=new THREE.ShaderMaterial({
         vertexShader:VERT, fragmentShader:FRAG,
-        extensions:{derivatives:true}, side:THREE.DoubleSide,
+        side:THREE.FrontSide,
         uniforms:{
             u_center:     {value:new THREE.Vector3()},
             u_axisA:      {value:new THREE.Vector3()},
