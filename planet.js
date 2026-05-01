@@ -300,7 +300,14 @@ varying float vRockVar; varying float vGroundVar;
 
 void main(){
     vec3 sp = normalize(u_center + u_axisA*position.x + u_axisB*position.y);
-    float raw = getRawElevation(sp);
+
+    // LOD seam fix: blend toward smooth single-octave base near chunk edges so
+    // adjacent chunks at different LOD levels agree at their shared boundary.
+    float _ex = min(position.x + 0.5, 0.5 - position.x);
+    float _ey = min(position.y + 0.5, 0.5 - position.y);
+    float edgeFade = smoothstep(0.0, 0.10, min(_ex, _ey));
+    float rawCoarse = snoise(sp * 2.0 + u_seedOffset) * 0.06 + 0.09;
+    float raw = mix(rawCoarse, getRawElevation(sp), edgeFade);
 
     // Erosion: two octaves of gradient-aligned gully displacement
     float g1 = erosionOctave(sp, 5.5);
@@ -319,9 +326,9 @@ void main(){
     vGroundVar=fbm2(sp*6.+vec3(70.,90.,10.))*.5+.5;
 
     float physElev = max(erodedElev, u_waterLevel);
-    vec3 localPos = sp*(u_radius + physElev*u_radius*.15);
+    vec3 localPos = sp*(u_radius + physElev*u_radius*0.08);
     // Skirt: pull inner skirt vertices below the surface to hide LOD seam cracks
-    if (position.z < -0.5) { localPos -= sp * u_radius * 0.06; }
+    if (position.z < -0.5) { localPos -= sp * u_radius * 0.12; }
     vLocalPos = localPos;
     vWorldPosition = localPos + u_planetCenter;
     gl_Position = projectionMatrix*viewMatrix*vec4(vWorldPosition,1.);
@@ -1164,7 +1171,7 @@ function animate(){
         if(mv.lengthSq()>0){ mv.normalize(); camera.position.addScaledVector(mv,1.); }
         const nn=camera.position.clone().sub(pp).normalize();
         const elev=getElevAt(nn,renderer);
-        const gr=pr+(elev*pr*.15);
+        const gr=pr+(elev*pr*.08);
         const cr=camera.position.clone().sub(pp).length();
         camera.position.copy(pp).addScaledVector(nn,cr+(gr+2.-cr)*.15);
     } else {
@@ -1172,7 +1179,7 @@ function animate(){
         if(pl){
             const off=camera.position.clone().sub(pl.position);
             const elev=getElevAt(off.clone().normalize(),renderer);
-            const gr=pr+elev*pr*.15;
+            const gr=pr+elev*pr*.08;
             controls.minDistance=gr+2.;
             const dist=off.length();
             const walkable=(pl.type.walkable!==false);
