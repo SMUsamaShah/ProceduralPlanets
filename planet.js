@@ -320,6 +320,8 @@ void main(){
 
     float physElev = max(erodedElev, u_waterLevel);
     vec3 localPos = sp*(u_radius + physElev*u_radius*.15);
+    // Skirt: pull inner skirt vertices below the surface to hide LOD seam cracks
+    if (position.z < -0.5) { localPos -= sp * u_radius * 0.06; }
     vLocalPos = localPos;
     vWorldPosition = localPos + u_planetCenter;
     gl_Position = projectionMatrix*viewMatrix*vec4(vWorldPosition,1.);
@@ -479,7 +481,53 @@ function getElevAt(nPos, renderer){
 }
 
 // ─── QUADTREE LOD ─────────────────────────────────────────────────────────────
-const chunkGeom=new THREE.PlaneGeometry(1,1,CHUNK_SEGMENTS,CHUNK_SEGMENTS);
+// Chunk geometry with skirt strips on all 4 edges.
+// Skirt inner vertices have position.z = -1; the vertex shader pulls them
+// inward by ~5% of planet radius, hiding cracks between adjacent LOD levels.
+function buildChunkGeom(N) {
+    const NP1 = N + 1;
+    const mainN = NP1 * NP1;
+    // Skirt: only INNER vertices (4 × NP1). Outer row reuses main-grid edge indices.
+    // This eliminates z-fighting between skirt and main terrain entirely.
+    const verts = new Float32Array((mainN + 4 * NP1) * 3);
+    const idx = [];
+
+    // Main grid: x,y in [-0.5,0.5], z=0
+    for (let j = 0; j <= N; j++) for (let i = 0; i <= N; i++) {
+        const v = (j * NP1 + i) * 3;
+        verts[v] = i/N - 0.5; verts[v+1] = j/N - 0.5; verts[v+2] = 0;
+    }
+    for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+        const a=j*NP1+i, b=a+1, c=a+NP1, d=c+1;
+        idx.push(a,b,c, b,d,c);
+    }
+
+    // Skirt inner vertices only (z=-1 → VERT shader pulls them below surface)
+    let sb = mainN;
+    function inner(x, y) { verts[sb*3]=x; verts[sb*3+1]=y; verts[sb*3+2]=-1; return sb++; }
+
+    // Bottom (j=0): outer = grid[i]
+    { const s=[]; for(let i=0;i<=N;i++) s.push(inner(i/N-0.5,-0.5));
+      for(let i=0;i<N;i++) idx.push(i,s[i],i+1, i+1,s[i],s[i+1]); }
+
+    // Top (j=N): outer = grid[N*NP1+i]
+    { const s=[]; for(let i=0;i<=N;i++) s.push(inner(i/N-0.5,0.5));
+      for(let i=0;i<N;i++){const o=N*NP1+i; idx.push(o,o+1,s[i], o+1,s[i+1],s[i]);} }
+
+    // Left (i=0): outer = grid[j*NP1]
+    { const s=[]; for(let j=0;j<=N;j++) s.push(inner(-0.5,j/N-0.5));
+      for(let j=0;j<N;j++){const o=j*NP1; idx.push(o,(j+1)*NP1,s[j], (j+1)*NP1,s[j+1],s[j]);} }
+
+    // Right (i=N): outer = grid[j*NP1+N]
+    { const s=[]; for(let j=0;j<=N;j++) s.push(inner(0.5,j/N-0.5));
+      for(let j=0;j<N;j++){const o=j*NP1+N; idx.push(o,s[j],(j+1)*NP1+N, (j+1)*NP1+N,s[j],s[j+1]);} }
+
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    g.setIndex(new THREE.BufferAttribute(new Uint32Array(idx), 1));
+    return g;
+}
+const chunkGeom = buildChunkGeom(CHUNK_SEGMENTS);
 
 class PlanetChunk {
     constructor(scene,center,axisA,axisB,level,matTpl,shared){
@@ -867,7 +915,7 @@ function init(){
     camera=new THREE.PerspectiveCamera(45,innerWidth/innerHeight,.5,NEW_GALAXY_RADIUS*4);
     camera.position.set(0,0,BASE_RADIUS*3.5);
 
-    renderer=new THREE.WebGLRenderer({antialias:true});
+    renderer=new THREE.WebGLRenderer({antialias:true, logarithmicDepthBuffer:true});
     renderer.setSize(innerWidth,innerHeight);
     renderer.setPixelRatio(Math.min(devicePixelRatio,1.5));
     document.body.appendChild(renderer.domElement);
