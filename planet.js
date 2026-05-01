@@ -50,7 +50,10 @@ float snoise(vec3 v){
 // ─── CORE PROCEDURAL MATH (terrain + erosion) ─────────────────────────────────
 const CORE_MATH = `
 ${SNOISE}
-uniform vec3 u_seedOffset;
+uniform vec3  u_seedOffset;
+uniform float u_terrainMode;
+uniform float u_terrainParam;
+uniform float u_terrainParam2;
 
 vec3 _h33(vec3 p){
     p=vec3(dot(p,vec3(127.1,311.7,74.7)),dot(p,vec3(269.5,183.3,246.1)),dot(p,vec3(113.5,271.9,124.6)));
@@ -132,10 +135,71 @@ float erosionOctave(vec3 n, float cellScale) {
     return mix(1., cS*.5+.5, smoothstep(0., 0.06, slope));
 }
 
-float getRawElevation(vec3 pos) {
+float craterField(vec3 pos, float scale, float rimH, float floorD) {
+    vec3 sp = pos * scale + u_seedOffset * 1.3;
+    vec2 v = voronoi(sp);
+    float d = v.x;
+    float bnd = v.y - v.x;
+    // bowl interior
+    float bowl = smoothstep(0.0, 0.55, d) * (-floorD);
+    // raised rim
+    float rim  = (1.0 - abs(d - 0.55) / 0.18) * rimH * smoothstep(0.0, 0.12, bnd);
+    rim = max(rim, 0.0);
+    // small central peak
+    float peak = (1.0 - smoothstep(0.0, 0.12, d)) * rimH * 0.4;
+    // ejecta blanket
+    float ejecta = snoise(pos * scale * 3.0 + u_seedOffset) * 0.04
+                 * smoothstep(0.55, 1.0, d) * smoothstep(1.4, 0.6, d);
+    return bowl + rim + peak + ejecta;
+}
+
+float lavaChannels(vec3 pos, float scale, float depth) {
+    // Domain warp then voronoi edges become lava troughs
+    vec3 w = vec3(fbm2(pos*scale*0.7+10.), fbm2(pos*scale*0.7+20.), fbm2(pos*scale*0.7+30.));
+    vec3 wp = pos * scale + w * 0.5 + u_seedOffset;
+    vec2 v = voronoi(wp);
+    float edge = v.y - v.x;
+    // troughs at cell edges
+    float trough = (1.0 - smoothstep(0.0, 0.12, edge)) * (-depth);
+    return trough;
+}
+
+float terraceElevation(float raw, float steps, float sharpness) {
+    float s = raw * steps;
+    float floor_ = floor(s);
+    float frac_ = s - floor_;
+    // sigmoid quantize
+    float sig = 1.0 / (1.0 + exp(-(frac_ - 0.5) * sharpness * 10.0));
+    return (floor_ + sig) / steps;
+}
+
+float duneField(vec3 pos, float scale, float height) {
+    // Wind direction derived from seed
+    float wx = sin(u_seedOffset.x * 3.7 + 1.1);
+    float wz = cos(u_seedOffset.z * 2.9 + 0.7);
+    vec3 wind = normalize(vec3(wx, 0.0, wz));
+    float proj = dot(pos, wind);
+    // modulate dune amplitude with FBM
+    float amp = fbm2(pos * 1.8 + u_seedOffset * 0.5) * 0.5 + 0.5;
+    float dune = sin(proj * scale * 6.2832) * 0.5 + 0.5;
+    return dune * amp * height;
+}
+
+float crystalSpires(vec3 pos, float scale, float height) {
+    vec3 sp = pos * scale + u_seedOffset * 0.9;
+    vec2 v = voronoi(sp);
+    float d = v.x;
+    float bnd = v.y - v.x;
+    // sharp spike at cell center
+    float spike = pow(max(1.0 - d / 0.5, 0.0), 3.0) * height;
+    // edge ridges
+    float ridge = (1.0 - smoothstep(0.0, 0.06, bnd)) * height * 0.4;
+    return spike + ridge;
+}
+
+float _rawStandard(vec3 pos) {
     vec3 w = vec3(fbm4(pos*2.), fbm4(pos*2.+10.), fbm4(pos*2.+20.));
     vec3 wp = pos + w*0.4;
-
     vec2 vP = voronoi(wp*1.5); float pBnd = vP.y-vP.x;
     float bc = snoise((wp*1.)+u_seedOffset)*.5+.5;
     bc = mix(bc, vP.x, 0.4);
@@ -147,6 +211,30 @@ float getRawElevation(vec3 pos) {
     float plains = fbm8(wp*5.)*.03;
     return bc*.12 + lm*.05 + plains*lm + mm*peaks - cm*.08;
 }
+
+float getRawElevation(vec3 pos) {
+    float base = _rawStandard(pos);
+    if (u_terrainMode < 0.5) return base;
+    if (u_terrainMode < 1.5) {
+        // craters
+        return base * 0.3 + craterField(pos, u_terrainParam, 0.18, 0.12) + u_terrainParam2 * 0.05;
+    }
+    if (u_terrainMode < 2.5) {
+        // lava channels
+        return base + lavaChannels(pos, u_terrainParam, u_terrainParam2);
+    }
+    if (u_terrainMode < 3.5) {
+        // terraces
+        return terraceElevation(base, u_terrainParam, u_terrainParam2);
+    }
+    if (u_terrainMode < 4.5) {
+        // dunes
+        return base * 0.2 + duneField(pos, u_terrainParam, u_terrainParam2);
+    }
+    // spires (mode 5)
+    return base * 0.4 + crystalSpires(pos, u_terrainParam, u_terrainParam2);
+}
+
 float getSurfaceElevation(vec3 pos){ return max(getRawElevation(pos), 0.08); }
 `;
 
@@ -250,6 +338,10 @@ uniform vec3 u_snowColor; uniform vec3 u_rockColor;
 uniform float u_snowLine;
 uniform vec3 u_atmosZenith; uniform vec3 u_atmosHorizon;
 uniform float u_atmosOpacity;
+uniform float u_colorMode;
+uniform vec3  u_emissiveColor;
+uniform float u_emissiveStr;
+uniform vec3  u_seedOffset;
 
 void main(){
     float gv = vGroundVar;
@@ -265,6 +357,30 @@ void main(){
     vec3 landColor = mix(u_snowColor, u_highland, smoothstep(.10,.28,vClimate.y));
     landColor = mix(landColor, coldColor,  smoothstep(.28,.50,vClimate.y));
     landColor = mix(landColor, hotColor,   smoothstep(.55,.75,vClimate.y));
+
+    // Color mode overrides
+    if (u_colorMode > 0.5 && u_colorMode < 1.5) {
+        // molten: low elev = hot orange/red glow, high = dark rock
+        float heat = 1.0 - smoothstep(0.0, 0.18, vElevation);
+        landColor = mix(landColor, vec3(1.0, 0.3, 0.0), heat * 0.85);
+    } else if (u_colorMode > 1.5 && u_colorMode < 2.5) {
+        // ice: shift everything toward blue-white
+        landColor = mix(landColor, vec3(0.75, 0.88, 1.0), 0.55);
+    } else if (u_colorMode > 2.5 && u_colorMode < 3.5) {
+        // desert: warm tint
+        landColor = mix(landColor, vec3(0.85, 0.65, 0.30), 0.45);
+    } else if (u_colorMode > 3.5 && u_colorMode < 4.5) {
+        // alien: hue shift toward purple/teal
+        float hShift = snoise(vPlanetNormal * 3.0 + u_seedOffset) * 0.5 + 0.5;
+        vec3 alienTint = mix(vec3(0.55, 0.1, 0.8), vec3(0.0, 0.7, 0.6), hShift);
+        landColor = mix(landColor, alienTint, 0.6);
+    } else if (u_colorMode > 4.5) {
+        // bioluminescent: dark base, emissive patches via noise
+        float bio = snoise(vPlanetNormal * 6.0 + u_seedOffset) * 0.5 + 0.5;
+        float bioPatch = smoothstep(0.55, 0.75, bio);
+        landColor = mix(vec3(0.02, 0.04, 0.06), landColor * 0.3, 0.7);
+        landColor += u_emissiveColor * bioPatch * 0.8;
+    }
 
     // Slope normals (use local-space for float precision at large planet positions)
     vec3 dx=dFdx(vLocalPos); vec3 dy=dFdy(vLocalPos);
@@ -299,6 +415,7 @@ void main(){
     vec3 nv=vdist>.0001?vdr/vdist:vPlanetNormal;
     float headlamp=max(dot(normal,nv),0.)*.12;
     vec3 litColor=finalColor*(diffuse+.14+headlamp);
+    litColor += u_emissiveColor * u_emissiveStr * (vElevation < u_waterLevel + 0.05 ? 1.0 : 0.0);
 
     // Atmospheric fog — zenith/horizon from planet type
     float sunLight=dot(vPlanetNormal,u_sunDir);
@@ -332,7 +449,13 @@ const elevMat    = new THREE.ShaderMaterial({
             enc.xy-=enc.yz*(1./255.);
             gl_FragColor=vec4(enc,1.);
         }`,
-    uniforms:{ u_pos:{value:new THREE.Vector3()}, u_seedOffset:{value:new THREE.Vector3()} },
+    uniforms:{
+        u_pos:{value:new THREE.Vector3()},
+        u_seedOffset:{value:new THREE.Vector3()},
+        u_terrainMode:{value:0.0},
+        u_terrainParam:{value:3.0},
+        u_terrainParam2:{value:0.15}
+    },
     depthWrite:false, depthTest:false
 });
 const elevQuad = new THREE.Mesh(new THREE.PlaneGeometry(2,2), elevMat);
@@ -417,141 +540,197 @@ class PlanetChunk {
 }
 
 // ─── PLANET TYPES ─────────────────────────────────────────────────────────────
-// Each type fully specifies the visual planet. Uniforms are applied on focus.
 const PLANET_TYPES = [
-    {
-        name:'Terran', waterLevel:.09, snowLine:.54, erosionStr:.75,
-        hasClouds:true, cloudDensity:.52,
-        deepWater:   [.01,.07,.22], shallowWater:[.04,.38,.68], coast:[.80,.70,.48],
-        lowland:     [.28,.54,.20], midland:     [.20,.42,.15], highland:[.18,.30,.13],
-        snowColor:   [.88,.92,.98], rockColor:   [.42,.40,.37],
-        atmosZenith: [.02,.05,.15], atmosHorizon:[.30,.60,1.0], atmosOpacity:1.0,
-        dotHSL:[.57,.6,.5]
-    },
-    {
-        name:'Arid', waterLevel:.04, snowLine:.74, erosionStr:.95,
-        hasClouds:false, cloudDensity:0,
-        deepWater:   [.15,.10,.05], shallowWater:[.40,.28,.10], coast:[.78,.62,.36],
-        lowland:     [.72,.52,.26], midland:     [.60,.37,.16], highland:[.48,.28,.12],
-        snowColor:   [.82,.76,.62], rockColor:   [.52,.36,.20],
-        atmosZenith: [.08,.04,.01], atmosHorizon:[.80,.42,.12], atmosOpacity:.8,
-        dotHSL:[.07,.7,.55]
-    },
-    {
-        name:'Ocean', waterLevel:.22, snowLine:.48, erosionStr:.40,
-        hasClouds:true, cloudDensity:.68,
-        deepWater:   [.01,.04,.20], shallowWater:[.02,.25,.60], coast:[.60,.55,.35],
-        lowland:     [.22,.50,.20], midland:     [.18,.42,.18], highland:[.22,.34,.18],
-        snowColor:   [.90,.94,1.0], rockColor:   [.35,.34,.30],
-        atmosZenith: [.01,.04,.12], atmosHorizon:[.18,.52,.95], atmosOpacity:1.0,
-        dotHSL:[.62,.75,.40]
-    },
-    {
-        name:'Volcanic', waterLevel:.05, snowLine:.82, erosionStr:.20,
-        hasClouds:false, cloudDensity:0,
-        deepWater:   [.30,.02,.00], shallowWater:[.72,.10,.00], coast:[.20,.08,.04],
-        lowland:     [.10,.07,.06], midland:     [.14,.09,.07], highland:[.18,.11,.07],
-        snowColor:   [.24,.14,.09], rockColor:   [.09,.07,.06],
-        atmosZenith: [.04,.01,.00], atmosHorizon:[.60,.18,.04], atmosOpacity:.7,
-        dotHSL:[.03,.85,.40]
-    },
-    {
-        name:'Ice', waterLevel:.14, snowLine:.28, erosionStr:.50,
-        hasClouds:true, cloudDensity:.38,
-        deepWater:   [.10,.20,.45], shallowWater:[.45,.65,.85], coast:[.76,.84,.94],
-        lowland:     [.76,.86,.96], midland:     [.64,.78,.92], highland:[.52,.64,.82],
-        snowColor:   [.95,.97,1.0], rockColor:   [.50,.58,.72],
-        atmosZenith: [.02,.04,.10], atmosHorizon:[.52,.70,.95], atmosOpacity:.9,
-        dotHSL:[.58,.5,.78]
-    },
-    {
-        name:'Barren', waterLevel:.01, snowLine:.70, erosionStr:0,
-        hasClouds:false, cloudDensity:0,
-        deepWater:   [.10,.08,.06], shallowWater:[.20,.16,.12], coast:[.35,.28,.20],
-        lowland:     [.42,.36,.28], midland:     [.32,.27,.21], highland:[.24,.20,.16],
-        snowColor:   [.55,.50,.44], rockColor:   [.22,.18,.14],
-        atmosZenith: [0,0,0],       atmosHorizon:[0,0,0],       atmosOpacity:0,
-        dotHSL:[.06,.12,.45]
-    },
-    {
-        name:'Alien', waterLevel:.08, snowLine:.60, erosionStr:.65,
-        hasClouds:true, cloudDensity:.44,
-        deepWater:   [.05,.15,.25], shallowWater:[.10,.35,.50], coast:[.35,.22,.42],
-        lowland:     [.42,.12,.52], midland:     [.20,.06,.32], highland:[.52,.36,.14],
-        snowColor:   [.80,.58,.90], rockColor:   [.24,.14,.30],
-        atmosZenith: [.04,.00,.08], atmosHorizon:[.58,.18,.80], atmosOpacity:1.0,
-        dotHSL:[.80,.65,.52]
-    }
+    { name:'Terran',    terrainMode:0, colorMode:0, walkable:true,  waterLevel:.09, snowLine:.54, erosionStr:.75, hasClouds:true,  cloudDensity:.52,
+      deepWater:[.01,.07,.22],shallowWater:[.04,.38,.68],coast:[.80,.70,.48],lowland:[.28,.54,.20],midland:[.20,.42,.15],highland:[.18,.30,.13],snowColor:[.88,.92,.98],rockColor:[.42,.40,.37],atmosZenith:[.02,.05,.15],atmosHorizon:[.30,.60,1.],atmosOpacity:1.,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:3.,terrainParam2:.15,dotHSL:[.57,.6,.5] },
+    { name:'Jungle',    terrainMode:0, colorMode:0, walkable:true,  waterLevel:.12, snowLine:.65, erosionStr:.85, hasClouds:true,  cloudDensity:.70,
+      deepWater:[.01,.06,.18],shallowWater:[.03,.30,.55],coast:[.55,.58,.30],lowland:[.15,.40,.10],midland:[.12,.32,.08],highland:[.10,.24,.07],snowColor:[.75,.85,.70],rockColor:[.22,.20,.16],atmosZenith:[.01,.04,.08],atmosHorizon:[.12,.45,.15],atmosOpacity:1.,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:3.,terrainParam2:.15,dotHSL:[.30,.65,.35] },
+    { name:'Savanna',   terrainMode:0, colorMode:3, walkable:true,  waterLevel:.04, snowLine:.75, erosionStr:.70, hasClouds:false, cloudDensity:.10,
+      deepWater:[.18,.14,.04],shallowWater:[.45,.32,.12],coast:[.78,.62,.32],lowland:[.70,.55,.22],midland:[.58,.42,.16],highland:[.44,.30,.10],snowColor:[.80,.72,.55],rockColor:[.46,.34,.18],atmosZenith:[.06,.03,.00],atmosHorizon:[.75,.50,.18],atmosOpacity:.7,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:3.,terrainParam2:.15,dotHSL:[.09,.6,.55] },
+    { name:'Arid',      terrainMode:0, colorMode:3, walkable:true,  waterLevel:.04, snowLine:.74, erosionStr:.95, hasClouds:false, cloudDensity:0,
+      deepWater:[.15,.10,.05],shallowWater:[.40,.28,.10],coast:[.78,.62,.36],lowland:[.72,.52,.26],midland:[.60,.37,.16],highland:[.48,.28,.12],snowColor:[.82,.76,.62],rockColor:[.52,.36,.20],atmosZenith:[.08,.04,.01],atmosHorizon:[.80,.42,.12],atmosOpacity:.8,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:3.,terrainParam2:.15,dotHSL:[.07,.7,.55] },
+    { name:'Dune',      terrainMode:4, colorMode:3, walkable:true,  waterLevel:.01, snowLine:.90, erosionStr:.20, hasClouds:false, cloudDensity:.05,
+      deepWater:[.20,.15,.06],shallowWater:[.50,.36,.14],coast:[.82,.68,.38],lowland:[.78,.60,.28],midland:[.65,.46,.18],highland:[.50,.32,.12],snowColor:[.88,.80,.65],rockColor:[.55,.40,.22],atmosZenith:[.07,.04,.01],atmosHorizon:[.82,.48,.15],atmosOpacity:.6,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:2.5,terrainParam2:.18,dotHSL:[.08,.75,.60] },
+    { name:'Ocean',     terrainMode:0, colorMode:0, walkable:true,  waterLevel:.22, snowLine:.48, erosionStr:.40, hasClouds:true,  cloudDensity:.68,
+      deepWater:[.01,.04,.20],shallowWater:[.02,.25,.60],coast:[.60,.55,.35],lowland:[.22,.50,.20],midland:[.18,.42,.18],highland:[.22,.34,.18],snowColor:[.90,.94,1.],rockColor:[.35,.34,.30],atmosZenith:[.01,.04,.12],atmosHorizon:[.18,.52,.95],atmosOpacity:1.,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:3.,terrainParam2:.15,dotHSL:[.62,.75,.40] },
+    { name:'Archipelago',terrainMode:0,colorMode:0, walkable:true,  waterLevel:.16, snowLine:.55, erosionStr:.60, hasClouds:true,  cloudDensity:.55,
+      deepWater:[.01,.05,.22],shallowWater:[.03,.28,.62],coast:[.75,.68,.40],lowland:[.25,.52,.18],midland:[.20,.40,.14],highland:[.18,.28,.12],snowColor:[.88,.92,.98],rockColor:[.38,.36,.30],atmosZenith:[.02,.05,.14],atmosHorizon:[.25,.55,.92],atmosOpacity:1.,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:3.,terrainParam2:.15,dotHSL:[.55,.65,.45] },
+    { name:'Volcanic',  terrainMode:2, colorMode:1, walkable:true,  waterLevel:.05, snowLine:.82, erosionStr:.20, hasClouds:false, cloudDensity:0,
+      deepWater:[.30,.02,.00],shallowWater:[.72,.10,.00],coast:[.20,.08,.04],lowland:[.10,.07,.06],midland:[.14,.09,.07],highland:[.18,.11,.07],snowColor:[.24,.14,.09],rockColor:[.09,.07,.06],atmosZenith:[.04,.01,.00],atmosHorizon:[.60,.18,.04],atmosOpacity:.7,emissiveColor:[1.,.25,.0],emissiveStr:.8,terrainParam:2.8,terrainParam2:.22,dotHSL:[.03,.85,.40] },
+    { name:'Caldera',   terrainMode:1, colorMode:1, walkable:true,  waterLevel:.06, snowLine:.85, erosionStr:.10, hasClouds:false, cloudDensity:0,
+      deepWater:[.35,.04,.00],shallowWater:[.80,.14,.00],coast:[.22,.10,.04],lowland:[.11,.08,.06],midland:[.15,.10,.07],highland:[.19,.12,.07],snowColor:[.28,.16,.10],rockColor:[.10,.08,.06],atmosZenith:[.05,.01,.00],atmosHorizon:[.65,.20,.05],atmosOpacity:.6,emissiveColor:[1.,.35,.0],emissiveStr:1.2,terrainParam:3.5,terrainParam2:.20,dotHSL:[.04,.90,.38] },
+    { name:'Ice',       terrainMode:0, colorMode:2, walkable:true,  waterLevel:.14, snowLine:.28, erosionStr:.50, hasClouds:true,  cloudDensity:.38,
+      deepWater:[.10,.20,.45],shallowWater:[.45,.65,.85],coast:[.76,.84,.94],lowland:[.76,.86,.96],midland:[.64,.78,.92],highland:[.52,.64,.82],snowColor:[.95,.97,1.],rockColor:[.50,.58,.72],atmosZenith:[.02,.04,.10],atmosHorizon:[.52,.70,.95],atmosOpacity:.9,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:3.,terrainParam2:.15,dotHSL:[.58,.5,.78] },
+    { name:'Frozen',    terrainMode:3, colorMode:2, walkable:true,  waterLevel:.10, snowLine:.20, erosionStr:.30, hasClouds:true,  cloudDensity:.30,
+      deepWater:[.08,.18,.40],shallowWater:[.40,.60,.82],coast:[.72,.82,.92],lowland:[.80,.90,.98],midland:[.70,.82,.95],highland:[.60,.72,.90],snowColor:[.96,.98,1.],rockColor:[.55,.62,.78],atmosZenith:[.02,.05,.12],atmosHorizon:[.50,.68,.92],atmosOpacity:.85,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:5.,terrainParam2:8.,dotHSL:[.57,.45,.82] },
+    { name:'Barren',    terrainMode:0, colorMode:0, walkable:true,  waterLevel:.01, snowLine:.70, erosionStr:0,   hasClouds:false, cloudDensity:0,
+      deepWater:[.10,.08,.06],shallowWater:[.20,.16,.12],coast:[.35,.28,.20],lowland:[.42,.36,.28],midland:[.32,.27,.21],highland:[.24,.20,.16],snowColor:[.55,.50,.44],rockColor:[.22,.18,.14],atmosZenith:[0,0,0],atmosHorizon:[0,0,0],atmosOpacity:0,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:3.,terrainParam2:.15,dotHSL:[.06,.12,.45] },
+    { name:'Cratered',  terrainMode:1, colorMode:0, walkable:true,  waterLevel:.01, snowLine:.80, erosionStr:0,   hasClouds:false, cloudDensity:0,
+      deepWater:[.08,.07,.05],shallowWater:[.18,.14,.10],coast:[.32,.25,.18],lowland:[.38,.32,.24],midland:[.28,.24,.18],highland:[.22,.18,.14],snowColor:[.50,.46,.40],rockColor:[.20,.16,.12],atmosZenith:[0,0,0],atmosHorizon:[0,0,0],atmosOpacity:0,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:4.,terrainParam2:.18,dotHSL:[.07,.10,.38] },
+    { name:'Metallic',  terrainMode:0, colorMode:0, walkable:true,  waterLevel:.02, snowLine:.72, erosionStr:.15, hasClouds:false, cloudDensity:0,
+      deepWater:[.20,.18,.14],shallowWater:[.42,.36,.24],coast:[.58,.50,.34],lowland:[.60,.52,.38],midland:[.50,.44,.30],highland:[.40,.34,.22],snowColor:[.72,.68,.60],rockColor:[.32,.28,.22],atmosZenith:[.01,.01,.01],atmosHorizon:[.12,.10,.08],atmosOpacity:.2,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:3.,terrainParam2:.15,dotHSL:[.10,.20,.55] },
+    { name:'Alien',     terrainMode:0, colorMode:4, walkable:true,  waterLevel:.08, snowLine:.60, erosionStr:.65, hasClouds:true,  cloudDensity:.44,
+      deepWater:[.05,.15,.25],shallowWater:[.10,.35,.50],coast:[.35,.22,.42],lowland:[.42,.12,.52],midland:[.20,.06,.32],highland:[.52,.36,.14],snowColor:[.80,.58,.90],rockColor:[.24,.14,.30],atmosZenith:[.04,.00,.08],atmosHorizon:[.58,.18,.80],atmosOpacity:1.,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:3.,terrainParam2:.15,dotHSL:[.80,.65,.52] },
+    { name:'Crystal',   terrainMode:5, colorMode:4, walkable:true,  waterLevel:.02, snowLine:.85, erosionStr:.05, hasClouds:false, cloudDensity:0,
+      deepWater:[.04,.12,.20],shallowWater:[.08,.28,.42],coast:[.30,.18,.38],lowland:[.38,.10,.48],midland:[.18,.05,.28],highland:[.50,.34,.12],snowColor:[.85,.62,.95],rockColor:[.22,.12,.28],atmosZenith:[.03,.00,.06],atmosHorizon:[.50,.15,.72],atmosOpacity:.8,emissiveColor:[.4,.1,.9],emissiveStr:.6,terrainParam:4.5,terrainParam2:.28,dotHSL:[.78,.70,.58] },
+    { name:'Bioluminescent',terrainMode:0,colorMode:5,walkable:true,waterLevel:.08,snowLine:.60,erosionStr:.55,hasClouds:true,cloudDensity:.48,
+      deepWater:[.02,.08,.14],shallowWater:[.04,.18,.28],coast:[.08,.14,.18],lowland:[.03,.06,.04],midland:[.02,.05,.03],highland:[.04,.06,.08],snowColor:[.06,.10,.12],rockColor:[.05,.05,.05],atmosZenith:[.00,.02,.04],atmosHorizon:[.02,.10,.18],atmosOpacity:.9,emissiveColor:[.0,.8,.4],emissiveStr:.5,terrainParam:3.,terrainParam2:.15,dotHSL:[.45,.70,.38] },
+    { name:'Toxic',     terrainMode:3, colorMode:4, walkable:true,  waterLevel:.10, snowLine:.65, erosionStr:.50, hasClouds:true,  cloudDensity:.80,
+      deepWater:[.08,.12,.02],shallowWater:[.22,.32,.04],coast:[.50,.48,.08],lowland:[.45,.52,.06],midland:[.35,.42,.04],highland:[.28,.35,.04],snowColor:[.65,.72,.20],rockColor:[.30,.28,.08],atmosZenith:[.04,.06,.00],atmosHorizon:[.45,.55,.08],atmosOpacity:1.2,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:4.,terrainParam2:6.,dotHSL:[.22,.75,.45] },
+    { name:'GasGiant',  terrainMode:3, colorMode:0, walkable:false, waterLevel:.50, snowLine:.10, erosionStr:0,   hasClouds:false, cloudDensity:0,
+      deepWater:[.30,.18,.08],shallowWater:[.55,.38,.18],coast:[.62,.45,.25],lowland:[.58,.42,.22],midland:[.48,.34,.18],highland:[.38,.26,.14],snowColor:[.70,.60,.50],rockColor:[.32,.24,.16],atmosZenith:[.06,.04,.02],atmosHorizon:[.50,.35,.15],atmosOpacity:.5,emissiveColor:[0,0,0],emissiveStr:0,terrainParam:6.,terrainParam2:3.,dotHSL:[.08,.45,.62] }
 ];
 
-// ─── GALAXY GENERATION ────────────────────────────────────────────────────────
-function generateGalaxy(seedStr){
-    const rng=makeRng(hashStr(seedStr));
-    const planets=[];
+// ─── NAMING ───────────────────────────────────────────────────────────────────
+const _ONSETS=['Kr','Vel','Tar','Sol','Men','Ath','Dur','Zar','Per','Kal','Vor','Aer','Syl','Thr','Bel','Xen','Ost','Fal','Mir','Dun','Cet','Ral'];
+const _NUCLEI=['an','os','ei','ar','um','is','on','al','en','or','ax','il','un','eth','ael','ior','aus','yn','ek','ub'];
+const _CODAS=['','','','ix','as','or','um','is','ax','en','ys','ath','on','el','ar'];
+const _SUFFIXES=['','','','','Prime','Minor','Major','Alpha','Beta','Gamma','Delta'];
 
-    function makePlanet(id, pos){
-        const type=PLANET_TYPES[Math.floor(rng()*PLANET_TYPES.length)];
-        const radius=3500+rng()*7000;   // 3500–10500 units
-        const seedOff=new THREE.Vector3(rng()*200-100,rng()*200-100,rng()*200-100);
-        const c=new THREE.Color().setHSL(...type.dotHSL);
-        return { id, position:pos, type, radius, seedOffset:seedOff, color:c,
-                 dotSize:4+rng()*12 };
+function _syllable(rng){ return _ONSETS[Math.floor(rng()*_ONSETS.length)]+_NUCLEI[Math.floor(rng()*_NUCLEI.length)]+_CODAS[Math.floor(rng()*_CODAS.length)]; }
+function generateSystemName(rng){
+    const n=1+Math.floor(rng()*2);
+    let s='';for(let i=0;i<n;i++)s+=_syllable(rng);
+    const suf=_SUFFIXES[Math.floor(rng()*_SUFFIXES.length)];
+    return s+(suf?' '+suf:'');
+}
+function generatePlanetName(sysName, idx, rng){
+    const romans=['I','II','III','IV','V','VI'];
+    return sysName+' '+(romans[idx]||'I');
+}
+
+// ─── VARIATION HELPERS ────────────────────────────────────────────────────────
+function _lerp(a,b,t){return a+(b-a)*t;}
+function _varyRGB(base, spread, rng){
+    return base.map(v=>Math.max(0,Math.min(1, v+(_lerp(-spread,spread,rng())))));
+}
+
+// ─── GALAXY GENERATION ────────────────────────────────────────────────────────
+const NUM_SYSTEMS   = 500;
+const NEW_GALAXY_RADIUS = 30_000_000;
+const MIN_SYS_SPACING   = 800_000;
+
+const STAR_CLASSES=[
+    {name:'O', weight:.001, color:[0.55,0.65,1.00], dotSize:12},
+    {name:'B', weight:.01,  color:[0.72,0.82,1.00], dotSize:10},
+    {name:'A', weight:.05,  color:[0.90,0.94,1.00], dotSize: 8},
+    {name:'F', weight:.10,  color:[1.00,1.00,0.95], dotSize: 7},
+    {name:'G', weight:.14,  color:[1.00,0.96,0.78], dotSize: 6},
+    {name:'K', weight:.16,  color:[1.00,0.80,0.45], dotSize: 5},
+    {name:'M', weight:.76,  color:[1.00,0.55,0.25], dotSize: 4},
+    {name:'WD',weight:.02,  color:[0.85,0.90,1.00], dotSize: 3},
+    {name:'NS',weight:.002, color:[0.70,0.85,1.00], dotSize: 3},
+];
+(function buildWeights(){
+    let sum=0; STAR_CLASSES.forEach(s=>sum+=s.weight);
+    let acc=0; STAR_CLASSES.forEach(s=>{s.cumW=(acc+=s.weight/sum);});
+})();
+function pickStarClass(rng){
+    const r=rng(); for(const s of STAR_CLASSES)if(r<s.cumW)return s;
+    return STAR_CLASSES[STAR_CLASSES.length-1];
+}
+
+function generateSystems(seedStr){
+    const rng=makeRng(hashStr(seedStr));
+    const systems=[];
+
+    function makePlanetForSystem(sysId, sysPos, sysName, planetIdx, prng){
+        const type=PLANET_TYPES[Math.floor(prng()*PLANET_TYPES.length)];
+        const radius=3500+prng()*7000;
+        const spread=0.02;
+        const vary=a=>_varyRGB(a,spread,prng);
+        // Per-planet variation: slight color tweaks
+        const t=Object.assign({},type,{
+            deepWater:vary(type.deepWater), shallowWater:vary(type.shallowWater),
+            coast:vary(type.coast), lowland:vary(type.lowland), midland:vary(type.midland),
+            highland:vary(type.highland), snowColor:vary(type.snowColor), rockColor:vary(type.rockColor),
+            waterLevel: Math.max(0,type.waterLevel+(_lerp(-.03,.03,prng()))),
+            snowLine:   Math.max(0.1,type.snowLine+(_lerp(-.06,.06,prng()))),
+            erosionStr: Math.max(0,type.erosionStr+(_lerp(-.15,.15,prng()))),
+            terrainParam: type.terrainParam*(0.85+prng()*.30),
+        });
+        const seedOff=new THREE.Vector3(prng()*200-100,prng()*200-100,prng()*200-100);
+        const orbitR=(1+planetIdx)*800_000*(0.6+prng()*.8);
+        const orbitA=prng()*Math.PI*2;
+        const pos=sysPos.clone().add(new THREE.Vector3(Math.cos(orbitA)*orbitR,0,Math.sin(orbitA)*orbitR));
+        const dotH=t.dotHSL[0]+(prng()-.5)*.12;
+        const c=new THREE.Color().setHSL(((dotH%1)+1)%1, t.dotHSL[1], t.dotHSL[2]);
+        const name=generatePlanetName(sysName,planetIdx,prng);
+        return { id:`${sysId}-${planetIdx}`, systemId:sysId, systemName:sysName,
+                 position:pos, type:t, typeName:type.name, name, radius,
+                 seedOffset:seedOff, color:c, dotSize:3+prng()*8,
+                 orbitRadius:orbitR, orbitAngle:orbitA };
     }
 
-    // Planet 0 always at origin
-    planets.push(makePlanet(0, new THREE.Vector3()));
+    // System 0 at origin
+    const sys0Name=generateSystemName(rng);
+    const sys0Class=pickStarClass(rng);
+    const sys0Planets=[];
+    const nP0=2+Math.floor(rng()*3);
+    const s0rng=makeRng(hashStr(seedStr+'sys0'));
+    for(let i=0;i<nP0;i++) sys0Planets.push(makePlanetForSystem(0,new THREE.Vector3(),sys0Name,i,s0rng));
+    systems.push({id:0,name:sys0Name,position:new THREE.Vector3(),starClass:sys0Class,color:new THREE.Color(...sys0Class.color),dotSize:sys0Class.dotSize,planets:sys0Planets});
 
-    // Sparse clustering: build 6-10 clusters in a disc with empty voids between
-    const NUM_CLUSTERS=6+Math.floor(rng()*5);
+    // Clustered spiral arms
+    const NUM_CLUSTERS=8+Math.floor(rng()*5);
     const clusters=[];
     for(let c=0;c<NUM_CLUSTERS;c++){
-        const arm=Math.floor(rng()*4);          // 4 arms
-        const r=(0.12+Math.pow(rng(),1.4)*.88)*GALAXY_RADIUS;
+        const arm=Math.floor(rng()*4);
+        const r=(0.12+Math.pow(rng(),1.4)*.88)*NEW_GALAXY_RADIUS;
         const baseAngle=arm*(Math.PI*.5);
-        const spiralTwist=(r/GALAXY_RADIUS)*Math.PI*.8;
-        const angle=baseAngle+spiralTwist+(rng()-.5)*0.6;
+        const spiralTwist=(r/NEW_GALAXY_RADIUS)*Math.PI*.8;
+        const angle=baseAngle+spiralTwist+(rng()-.5)*.6;
         clusters.push({
             pos:new THREE.Vector3(r*Math.cos(angle),(rng()-.5)*r*.18,r*Math.sin(angle)),
-            spread:120_000+rng()*380_000,
-            count:8+Math.floor(rng()*22)
+            spread:500_000+rng()*1_500_000,
+            count:10+Math.floor(rng()*28)
         });
     }
 
     let attempts=0;
-    // Place planets in clusters
     for(const cl of clusters){
         let placed=0;
-        while(placed<cl.count && planets.length<NUM_PLANETS && attempts<12000){
+        while(placed<cl.count&&systems.length<NUM_SYSTEMS&&attempts<30000){
             attempts++;
-            const u=rng()+1e-6, v=rng();
+            const u=rng()+1e-6,v=rng();
             const r=cl.spread*Math.sqrt(-2*Math.log(u));
             const theta=v*Math.PI*2;
             const phi=Math.acos(2*rng()-1);
-            const offset=new THREE.Vector3(
-                r*Math.sin(phi)*Math.cos(theta),
-                r*Math.sin(phi)*Math.sin(theta)*.25,
-                r*Math.cos(phi)
-            );
+            const offset=new THREE.Vector3(r*Math.sin(phi)*Math.cos(theta),r*Math.sin(phi)*Math.sin(theta)*.25,r*Math.cos(phi));
             const pos=cl.pos.clone().add(offset);
-            if(pos.length()>GALAXY_RADIUS*1.1) continue;
+            if(pos.length()>NEW_GALAXY_RADIUS*1.1) continue;
             let ok=true;
-            for(const p of planets) if(pos.distanceTo(p.position)<MIN_SPACING){ok=false;break;}
-            if(ok){ planets.push(makePlanet(planets.length,pos)); placed++; }
+            for(const s of systems) if(pos.distanceTo(s.position)<MIN_SYS_SPACING){ok=false;break;}
+            if(!ok) continue;
+            const sid=systems.length;
+            const sName=generateSystemName(rng);
+            const sClass=pickStarClass(rng);
+            const srng=makeRng(hashStr(seedStr+'sys'+sid));
+            const nPl=1+Math.floor(srng()*6);
+            const planets=[];
+            for(let i=0;i<nPl;i++) planets.push(makePlanetForSystem(sid,pos,sName,i,srng));
+            systems.push({id:sid,name:sName,position:pos,starClass:sClass,color:new THREE.Color(...sClass.color),dotSize:sClass.dotSize,planets});
+            placed++;
         }
     }
-    // Fill remaining with scattered outliers (sparser)
-    while(planets.length<NUM_PLANETS && attempts<20000){
+    while(systems.length<NUM_SYSTEMS&&attempts<60000){
         attempts++;
-        const theta=rng()*Math.PI*2, phi=Math.acos(2*rng()-1);
-        const r=Math.pow(rng(),1.6)*GALAXY_RADIUS;
-        const pos=new THREE.Vector3(
-            r*Math.sin(phi)*Math.cos(theta),(rng()-.5)*r*.15,r*Math.cos(phi)
-        );
+        const theta=rng()*Math.PI*2,phi=Math.acos(2*rng()-1);
+        const r=Math.pow(rng(),1.6)*NEW_GALAXY_RADIUS;
+        const pos=new THREE.Vector3(r*Math.sin(phi)*Math.cos(theta),(rng()-.5)*r*.15,r*Math.cos(phi));
         let ok=true;
-        for(const p of planets) if(pos.distanceTo(p.position)<MIN_SPACING*1.5){ok=false;break;}
-        if(ok) planets.push(makePlanet(planets.length,pos));
+        for(const s of systems) if(pos.distanceTo(s.position)<MIN_SYS_SPACING*1.5){ok=false;break;}
+        if(!ok) continue;
+        const sid=systems.length;
+        const sName=generateSystemName(rng);
+        const sClass=pickStarClass(rng);
+        const srng=makeRng(hashStr(seedStr+'sys'+sid));
+        const nPl=1+Math.floor(srng()*6);
+        const planets=[];
+        for(let i=0;i<nPl;i++) planets.push(makePlanetForSystem(sid,pos,sName,i,srng));
+        systems.push({id:sid,name:sName,position:pos,starClass:sClass,color:new THREE.Color(...sClass.color),dotSize:sClass.dotSize,planets});
     }
-    return planets;
+    return systems;
 }
 
 // ─── APP STATE ────────────────────────────────────────────────────────────────
@@ -565,21 +744,28 @@ const CUBE_FACES=[
 ];
 
 let scene, camera, renderer, controls;
-let galaxyPlanets=[], focusedIdx=0, rootChunks=[];
-let atmosMesh, cloudMesh, dotGeom, dotMat;
+let galaxySystems=[], focusedSysIdx=0, focusedPlIdx=0, rootChunks=[];
+let atmosMesh, cloudMesh, systemDotGeom, systemDotMat, planetDotGeom, planetDotMat;
+let systemDotPoints, planetDotPoints;
 let baseMaterial, atmosMat, cloudMatRef;
-let sharedU; // shared uniform references for chunk cloning
+let sharedU;
 let activePlanetRadius=BASE_RADIUS;
 let transitioning=false, transitionT=0;
 let transitionStartCam, transitionEndCam, transitionStartTgt, transitionEndTgt;
 let isWalking=false, canWalk=false, camYaw=0, camPitch=0;
+let systemView=false;
 const keys={};
 const sunDir=new THREE.Vector3(1,.8,.5).normalize();
 const _proj=new THREE.Vector3();
 
+// flat list of all planets for legacy click detection
+function allPlanets(){ return galaxySystems.flatMap(s=>s.planets); }
+function focusedPlanet(){ return (galaxySystems[focusedSysIdx]||{planets:[]}).planets[focusedPlIdx]; }
+
 // ─── FOCUS PLANET ─────────────────────────────────────────────────────────────
-function focusPlanet(idx, immediate=false){
-    const pl=galaxyPlanets[idx];
+function focusPlanet(sysIdx, plIdx, immediate=false){
+    focusedSysIdx=sysIdx; focusedPlIdx=plIdx;
+    const pl=focusedPlanet();
     if(!pl) return;
 
     // Destroy current LOD
@@ -607,9 +793,18 @@ function focusPlanet(idx, immediate=false){
     sharedU.atmosZenith.value.set(...t.atmosZenith);
     sharedU.atmosHorizon.value.set(...t.atmosHorizon);
     sharedU.atmosOpacity.value=t.atmosOpacity;
+    sharedU.terrainMode.value=t.terrainMode||0;
+    sharedU.terrainParam.value=t.terrainParam||3.0;
+    sharedU.terrainParam2.value=t.terrainParam2||0.15;
+    sharedU.colorMode.value=t.colorMode||0;
+    sharedU.emissiveColor.value.set(...(t.emissiveColor||[0,0,0]));
+    sharedU.emissiveStr.value=t.emissiveStr||0;
 
-    // Elevation reader seed
+    // Elevation reader seed + terrain mode
     elevMat.uniforms.u_seedOffset.value.copy(pl.seedOffset);
+    elevMat.uniforms.u_terrainMode.value=t.terrainMode||0;
+    elevMat.uniforms.u_terrainParam.value=t.terrainParam||3.0;
+    elevMat.uniforms.u_terrainParam2.value=t.terrainParam2||0.15;
 
     // Atmosphere + cloud meshes follow planet
     atmosMesh.position.copy(pl.position);
@@ -630,17 +825,8 @@ function focusPlanet(idx, immediate=false){
     for(const f of CUBE_FACES)
         rootChunks.push(new PlanetChunk(scene,f.c,f.a,f.b,0,baseMaterial,sharedU));
 
-    // Hide focused planet dot, show others
-    const col=dotGeom.attributes.color.array;
-    const siz=dotGeom.attributes.size.array;
-    for(let i=0;i<galaxyPlanets.length;i++){
-        const p=galaxyPlanets[i];
-        const hide=(i===idx);
-        col[i*3]=hide?0:p.color.r; col[i*3+1]=hide?0:p.color.g; col[i*3+2]=hide?0:p.color.b;
-        siz[i]=hide?0:p.dotSize;
-    }
-    dotGeom.attributes.color.needsUpdate=true;
-    dotGeom.attributes.size.needsUpdate=true;
+    // Update planet sub-dots: hide focused planet, show others in system
+    if(window._updatePlanetDots) window._updatePlanetDots(sysIdx, plIdx);
 
     if(!immediate){
         const vd=camera.position.clone().sub(controls.target).normalize();
@@ -654,15 +840,20 @@ function focusPlanet(idx, immediate=false){
         camera.position.copy(pl.position).add(new THREE.Vector3(0,0,pl.radius*3.5));
     }
 
-    focusedIdx=idx;
-    document.getElementById('planet-text').textContent=
-        `${t.name} · #${idx+1} of ${galaxyPlanets.length}`;
+    const sys=galaxySystems[sysIdx];
+    document.getElementById('system-text').textContent=`System: ${sys.name} (${sys.starClass.name}-class)`;
+    document.getElementById('planet-text').textContent=`Planet: ${pl.name}`;
+    document.getElementById('planet-type-text').textContent=`Type: ${pl.typeName}`;
+    document.getElementById('planet-nav-text').textContent=`← → to cycle ${sys.planets.length} planets`;
+    if(t.walkable===false){
+        canWalk=false; document.getElementById('walk-prompt').style.display='none';
+    }
 }
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 function init(){
     scene=new THREE.Scene();
-    camera=new THREE.PerspectiveCamera(45,innerWidth/innerHeight,.5,GALAXY_RADIUS*4);
+    camera=new THREE.PerspectiveCamera(45,innerWidth/innerHeight,.5,NEW_GALAXY_RADIUS*4);
     camera.position.set(0,0,BASE_RADIUS*3.5);
 
     renderer=new THREE.WebGLRenderer({antialias:true});
@@ -672,7 +863,7 @@ function init(){
 
     controls=new THREE.OrbitControls(camera,renderer.domElement);
     controls.enableDamping=true; controls.dampingFactor=.05;
-    controls.maxDistance=GALAXY_RADIUS*3.5;
+    controls.maxDistance=NEW_GALAXY_RADIUS*3.5;
 
     // Lights for dot mesh
     scene.add(new THREE.AmbientLight(0x334455,.9));
@@ -704,6 +895,12 @@ function init(){
         atmosZenith:  {value:new THREE.Vector3()},
         atmosHorizon: {value:new THREE.Vector3()},
         atmosOpacity: {value:1.0},
+        terrainMode:  {value:0.0},
+        terrainParam: {value:3.0},
+        terrainParam2:{value:0.15},
+        colorMode:    {value:0.0},
+        emissiveColor:{value:new THREE.Vector3()},
+        emissiveStr:  {value:0.0},
     };
 
     // Atmosphere
@@ -757,52 +954,78 @@ function init(){
             u_atmosZenith:sharedU.atmosZenith,
             u_atmosHorizon:sharedU.atmosHorizon,
             u_atmosOpacity:sharedU.atmosOpacity,
+            u_terrainMode: sharedU.terrainMode,
+            u_terrainParam:sharedU.terrainParam,
+            u_terrainParam2:sharedU.terrainParam2,
+            u_colorMode:   sharedU.colorMode,
+            u_emissiveColor:sharedU.emissiveColor,
+            u_emissiveStr: sharedU.emissiveStr,
         }
     });
 
-    // Planet dots
-    const dotPos=new Float32Array(NUM_PLANETS*3);
-    const dotCol=new Float32Array(NUM_PLANETS*3);
-    const dotSiz=new Float32Array(NUM_PLANETS);
-    dotGeom=new THREE.BufferGeometry();
-    dotGeom.setAttribute('position',new THREE.BufferAttribute(dotPos,3));
-    dotGeom.setAttribute('color',   new THREE.BufferAttribute(dotCol,3));
-    dotGeom.setAttribute('size',    new THREE.BufferAttribute(dotSiz,1));
-    dotMat=new THREE.ShaderMaterial({
-        transparent:true, depthWrite:false,
-        vertexShader:`
-            attribute float size; attribute vec3 color; varying vec3 vC;
-            void main(){ vC=color; gl_PointSize=size;
-                gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
-        fragmentShader:`
-            varying vec3 vC;
-            void main(){
-                vec2 uv=gl_PointCoord-.5; float r=length(uv);
-                if(r>.5) discard;
-                gl_FragColor=vec4(vC, 1.-smoothstep(.2,.5,r));}`
-    });
-    scene.add(new THREE.Points(dotGeom,dotMat));
+    // Shared dot shader
+    const DOT_VERT=`attribute float size; attribute vec3 color; varying vec3 vC;
+        void main(){ vC=color; gl_PointSize=size; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`;
+    const DOT_FRAG=`varying vec3 vC;
+        void main(){ vec2 uv=gl_PointCoord-.5; float r=length(uv); if(r>.5)discard; gl_FragColor=vec4(vC,1.-smoothstep(.2,.5,r));}`;
 
-    // Galaxy builder
-    function buildGalaxy(seedStr){
-        galaxyPlanets=generateGalaxy(seedStr);
-        const pos=dotGeom.attributes.position.array;
-        const col=dotGeom.attributes.color.array;
-        const siz=dotGeom.attributes.size.array;
-        for(let i=0;i<NUM_PLANETS;i++){
-            if(i<galaxyPlanets.length){
-                const p=galaxyPlanets[i];
+    // System dots (500, always visible)
+    systemDotGeom=new THREE.BufferGeometry();
+    systemDotGeom.setAttribute('position',new THREE.BufferAttribute(new Float32Array(NUM_SYSTEMS*3),3));
+    systemDotGeom.setAttribute('color',   new THREE.BufferAttribute(new Float32Array(NUM_SYSTEMS*3),3));
+    systemDotGeom.setAttribute('size',    new THREE.BufferAttribute(new Float32Array(NUM_SYSTEMS),1));
+    systemDotMat=new THREE.ShaderMaterial({transparent:true,depthWrite:false,vertexShader:DOT_VERT,fragmentShader:DOT_FRAG});
+    systemDotPoints=new THREE.Points(systemDotGeom,systemDotMat);
+    scene.add(systemDotPoints);
+
+    // Planet sub-dots (up to 3000 = 500 sys × 6 planets max)
+    const MAX_PLANET_DOTS=3000;
+    planetDotGeom=new THREE.BufferGeometry();
+    planetDotGeom.setAttribute('position',new THREE.BufferAttribute(new Float32Array(MAX_PLANET_DOTS*3),3));
+    planetDotGeom.setAttribute('color',   new THREE.BufferAttribute(new Float32Array(MAX_PLANET_DOTS*3),3));
+    planetDotGeom.setAttribute('size',    new THREE.BufferAttribute(new Float32Array(MAX_PLANET_DOTS),1));
+    planetDotMat=new THREE.ShaderMaterial({transparent:true,depthWrite:false,vertexShader:DOT_VERT,fragmentShader:DOT_FRAG});
+    planetDotPoints=new THREE.Points(planetDotGeom,planetDotMat);
+    planetDotPoints.visible=false;
+    scene.add(planetDotPoints);
+
+    function updatePlanetDots(sysIdx, focusPlIdx){
+        const sys=galaxySystems[sysIdx];
+        const pos=planetDotGeom.attributes.position.array;
+        const col=planetDotGeom.attributes.color.array;
+        const siz=planetDotGeom.attributes.size.array;
+        pos.fill(1e9); col.fill(0); siz.fill(0);
+        if(sys){
+            sys.planets.forEach((p,i)=>{
+                const hide=(i===focusPlIdx);
                 pos[i*3]=p.position.x; pos[i*3+1]=p.position.y; pos[i*3+2]=p.position.z;
-                col[i*3]=p.color.r;    col[i*3+1]=p.color.g;    col[i*3+2]=p.color.b;
-                siz[i]=p.dotSize;
-            } else {
-                pos[i*3]=1e9; siz[i]=0;
-            }
+                col[i*3]=hide?0:p.color.r; col[i*3+1]=hide?0:p.color.g; col[i*3+2]=hide?0:p.color.b;
+                siz[i]=hide?0:p.dotSize*2;
+            });
         }
-        dotGeom.attributes.position.needsUpdate=true;
-        dotGeom.attributes.color.needsUpdate=true;
-        dotGeom.attributes.size.needsUpdate=true;
-        focusPlanet(0,true);
+        planetDotGeom.attributes.position.needsUpdate=true;
+        planetDotGeom.attributes.color.needsUpdate=true;
+        planetDotGeom.attributes.size.needsUpdate=true;
+    }
+
+    // Expose updatePlanetDots to focusPlanet scope
+    window._updatePlanetDots=updatePlanetDots;
+
+    function buildGalaxy(seedStr){
+        galaxySystems=generateSystems(seedStr);
+        const pos=systemDotGeom.attributes.position.array;
+        const col=systemDotGeom.attributes.color.array;
+        const siz=systemDotGeom.attributes.size.array;
+        galaxySystems.forEach((sys,i)=>{
+            pos[i*3]=sys.position.x; pos[i*3+1]=sys.position.y; pos[i*3+2]=sys.position.z;
+            col[i*3]=sys.color.r;    col[i*3+1]=sys.color.g;    col[i*3+2]=sys.color.b;
+            siz[i]=sys.dotSize;
+        });
+        systemDotGeom.attributes.position.needsUpdate=true;
+        systemDotGeom.attributes.color.needsUpdate=true;
+        systemDotGeom.attributes.size.needsUpdate=true;
+        systemView=false; planetDotPoints.visible=false;
+        focusPlanet(0,0,true);
     }
 
     document.getElementById('seed-btn').addEventListener('click',e=>{
@@ -812,23 +1035,49 @@ function init(){
     document.getElementById('seed-input').addEventListener('click',e=>e.stopPropagation());
     buildGalaxy('RedTeam');
 
-    // Click — travel to planet or enter walk mode
+    // Click — travel to system or planet or enter walk mode
     renderer.domElement.addEventListener('click',e=>{
         if(isWalking||transitioning) return;
         if(e.target.id==='seed-input'||e.target.id==='seed-btn') return;
         const cx=e.clientX, cy=e.clientY;
-        let bestIdx=-1, bestDist=18*18;
-        for(let i=0;i<galaxyPlanets.length;i++){
-            if(i===focusedIdx) continue;
-            _proj.copy(galaxyPlanets[i].position).project(camera);
-            if(_proj.z>1) continue;
-            const sx=(_proj.x*.5+.5)*innerWidth;
-            const sy=(-.5*_proj.y+.5)*innerHeight;
-            const d=(sx-cx)**2+(sy-cy)**2;
-            if(d<bestDist){bestDist=d;bestIdx=i;}
+
+        if(systemView){
+            // In system view: click a planet sub-dot
+            const sys=galaxySystems[focusedSysIdx];
+            if(sys){
+                let bestI=-1, bestD=20*20;
+                sys.planets.forEach((p,i)=>{
+                    if(i===focusedPlIdx) return;
+                    _proj.copy(p.position).project(camera);
+                    if(_proj.z>1) return;
+                    const sx=(_proj.x*.5+.5)*innerWidth, sy=(-.5*_proj.y+.5)*innerHeight;
+                    const d=(sx-cx)**2+(sy-cy)**2;
+                    if(d<bestD){bestD=d;bestI=i;}
+                });
+                if(bestI>=0){focusPlanet(focusedSysIdx,bestI);return;}
+            }
         }
-        if(bestIdx>=0) focusPlanet(bestIdx);
-        else if(canWalk) document.body.requestPointerLock();
+
+        // Galaxy view: click a system dot
+        let bestSys=-1, bestD=20*20;
+        for(let i=0;i<galaxySystems.length;i++){
+            if(i===focusedSysIdx&&systemView) continue;
+            _proj.copy(galaxySystems[i].position).project(camera);
+            if(_proj.z>1) continue;
+            const sx=(_proj.x*.5+.5)*innerWidth, sy=(-.5*_proj.y+.5)*innerHeight;
+            const d=(sx-cx)**2+(sy-cy)**2;
+            if(d<bestD){bestD=d;bestSys=i;}
+        }
+        if(bestSys>=0){
+            focusedSysIdx=bestSys; systemView=true; planetDotPoints.visible=true;
+            // hide clicked system dot
+            const siz=systemDotGeom.attributes.size.array;
+            siz.fill(0,bestSys,bestSys+1);
+            systemDotGeom.attributes.size.needsUpdate=true;
+            focusPlanet(bestSys,0);
+            return;
+        }
+        if(canWalk) document.body.requestPointerLock();
     });
 
     window.addEventListener('resize',()=>{
@@ -839,10 +1088,19 @@ function init(){
         if(!isWalking) return;
         if(e.code==='KeyW'||e.code==='ArrowUp')   keys.fwd=d;
         if(e.code==='KeyS'||e.code==='ArrowDown')  keys.bwd=d;
-        if(e.code==='KeyA'||e.code==='ArrowLeft')  keys.lft=d;
-        if(e.code==='KeyD'||e.code==='ArrowRight') keys.rgt=d;
+        if(e.code==='KeyA')  keys.lft=d;
+        if(e.code==='KeyD')  keys.rgt=d;
     };
-    document.addEventListener('keydown',e=>setKey(e,true));
+    document.addEventListener('keydown',e=>{
+        setKey(e,true);
+        if(!isWalking&&systemView){
+            const sys=galaxySystems[focusedSysIdx];
+            if(!sys) return;
+            const n=sys.planets.length;
+            if(e.code==='ArrowLeft')  focusPlanet(focusedSysIdx,(focusedPlIdx-1+n)%n);
+            if(e.code==='ArrowRight') focusPlanet(focusedSysIdx,(focusedPlIdx+1)%n);
+        }
+    });
     document.addEventListener('keyup',  e=>setKey(e,false));
     document.addEventListener('mousemove',e=>{
         if(!isWalking||document.pointerLockElement!==document.body) return;
@@ -874,7 +1132,7 @@ function init(){
 // ─── ANIMATE ──────────────────────────────────────────────────────────────────
 function animate(){
     requestAnimationFrame(animate);
-    const pl=galaxyPlanets[focusedIdx];
+    const pl=focusedPlanet();
     const pr=activePlanetRadius;
 
     if(transitioning){
@@ -912,7 +1170,8 @@ function animate(){
             const gr=pr+elev*pr*.15;
             controls.minDistance=gr+2.;
             const dist=off.length();
-            if(dist-gr<20.){ canWalk=true; document.getElementById('walk-prompt').style.display='block'; }
+            const walkable=(pl.type.walkable!==false);
+            if(walkable&&dist-gr<20.){ canWalk=true; document.getElementById('walk-prompt').style.display='block'; }
             else { canWalk=false; document.getElementById('walk-prompt').style.display='none'; }
         }
     }
