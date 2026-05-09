@@ -455,9 +455,18 @@ const elevMat    = new THREE.ShaderMaterial({
     vertexShader: `void main(){gl_Position=vec4(position.xy,0.,1.);}`,
     fragmentShader: `
         ${CORE_MATH}
-        uniform vec3 u_pos;
+        uniform vec3  u_pos;
+        uniform float u_erosionStr;
         void main(){
-            float e=getSurfaceElevation(normalize(u_pos));
+            vec3 sp = normalize(u_pos);
+            float raw = getRawElevation(sp);
+            // Apply same erosion as VERT so elevation matches visual geometry
+            float g1 = erosionOctave(sp, 5.5);
+            float g2 = erosionOctave(sp, 11.5);
+            float gully = g1*.65 + g2*.35;
+            float erodeMask = smoothstep(u_waterLevel, u_waterLevel+.04, raw);
+            float eroded = raw + (gully-.5)*.05 * erodeMask * u_erosionStr;
+            float e = max(eroded, u_waterLevel);
             float v=clamp((e+2.)/5.,0.,1.);
             vec3 enc=fract(vec3(1.,255.,65025.)*v);
             enc.xy-=enc.yz*(1./255.);
@@ -467,6 +476,7 @@ const elevMat    = new THREE.ShaderMaterial({
         u_pos:{value:new THREE.Vector3()},
         u_seedOffset:{value:new THREE.Vector3()},
         u_waterLevel:{value:0.09},
+        u_erosionStr:{value:0.75},
         u_terrainMode:{value:0.0},
         u_terrainParam:{value:3.0},
         u_terrainParam2:{value:0.15}
@@ -477,6 +487,7 @@ const elevQuad = new THREE.Mesh(new THREE.PlaneGeometry(2,2), elevMat);
 elevQuad.frustumCulled=false;
 elevScene.add(elevQuad);
 let lastGoodElev=0.08;
+let smoothedElev=0.08;
 
 function getElevAt(nPos, renderer){
     elevMat.uniforms.u_pos.value.copy(nPos);
@@ -486,10 +497,14 @@ function getElevAt(nPos, renderer){
     const buf=new Uint8Array(4);
     renderer.readRenderTargetPixels(elevTarget,0,0,1,1,buf);
     renderer.setRenderTarget(prev);
-    if(!buf[0]&&!buf[1]&&!buf[2]) return lastGoodElev;
+    if(!buf[0]&&!buf[1]&&!buf[2]) return smoothedElev;
     let e=(buf[0]/255+buf[1]/65025+buf[2]/16581375)*5.-2.;
-    if(!isNaN(e)&&e>-1.) lastGoodElev=e;
-    return lastGoodElev;
+    if(!isNaN(e)&&e>-1.){
+        lastGoodElev=e;
+        // Snap up instantly so camera never sinks; ease down slowly to avoid jitter
+        smoothedElev = e > smoothedElev ? e : smoothedElev*.7+e*.3;
+    }
+    return smoothedElev;
 }
 
 // ─── QUADTREE LOD ─────────────────────────────────────────────────────────────
@@ -800,7 +815,7 @@ function focusPlanet(sysIdx, plIdx, immediate=false){
 
     // Destroy current LOD
     for(const c of rootChunks) c.destroy();
-    rootChunks=[]; lastGoodElev=pl.type.waterLevel;
+    rootChunks=[]; lastGoodElev=pl.type.waterLevel; smoothedElev=pl.type.waterLevel;
 
     const t=pl.type;
     activePlanetRadius=pl.radius;
@@ -830,9 +845,10 @@ function focusPlanet(sysIdx, plIdx, immediate=false){
     sharedU.emissiveColor.value.set(...(t.emissiveColor||[0,0,0]));
     sharedU.emissiveStr.value=t.emissiveStr||0;
 
-    // Elevation reader seed + terrain mode (must match VERT shader exactly)
+    // Elevation reader — must match VERT shader computation exactly
     elevMat.uniforms.u_seedOffset.value.copy(pl.seedOffset);
     elevMat.uniforms.u_waterLevel.value=t.waterLevel;
+    elevMat.uniforms.u_erosionStr.value=t.erosionStr;
     elevMat.uniforms.u_terrainMode.value=t.terrainMode||0;
     elevMat.uniforms.u_terrainParam.value=t.terrainParam||3.0;
     elevMat.uniforms.u_terrainParam2.value=t.terrainParam2||0.15;
@@ -1150,7 +1166,7 @@ function animate(){
         const elev=getElevAt(nn,renderer);
         const gr=pr+(elev*pr*.08);
         const cr=camera.position.clone().sub(pp).length();
-        camera.position.copy(pp).addScaledVector(nn,cr+(gr+2.-cr)*.15);
+        camera.position.copy(pp).addScaledVector(nn,cr+(gr+4.-cr)*.35);
     } else {
         controls.update();
         if(pl){
