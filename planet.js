@@ -501,8 +501,8 @@ function getElevAt(nPos, renderer){
     let e=(buf[0]/255+buf[1]/65025+buf[2]/16581375)*5.-2.;
     if(!isNaN(e)&&e>-1.){
         lastGoodElev=e;
-        // Snap up instantly so camera never sinks; ease down slowly to avoid jitter
-        smoothedElev = e > smoothedElev ? e : smoothedElev*.7+e*.3;
+        // EMA smoothing absorbs frame-to-frame GPU precision noise
+        smoothedElev = smoothedElev*.55+e*.45;
     }
     return smoothedElev;
 }
