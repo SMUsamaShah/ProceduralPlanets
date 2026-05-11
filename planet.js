@@ -335,8 +335,11 @@ void main(){
     vNormal = normalize(cross(pA, pB));
 
     vLocalPos = localPos;
+    // u_planetCenter is updated every frame as (planet.position - camera.position) in JS float64.
+    // This keeps vWorldPosition small, avoiding float32 catastrophic cancellation at galaxy scale.
+    // Rotation-only view matrix is used since the camera translation is already baked in.
     vWorldPosition = localPos + u_planetCenter;
-    gl_Position = projectionMatrix*viewMatrix*vec4(vWorldPosition,1.);
+    gl_Position = projectionMatrix*mat4(mat3(viewMatrix))*vec4(vWorldPosition,1.);
 }`;
 
 // ─── PLANET TERRAIN FRAGMENT SHADER ───────────────────────────────────────────
@@ -421,11 +424,13 @@ void main(){
     // Lighting
     float diffuse = max(dot(vElevation<u_waterLevel-.005 ? vPlanetNormal : normal, u_sunDir), 0.);
     if(vElevation<=u_waterLevel+.001){
-        vec3 vd=normalize(cameraPosition-vWorldPosition);
+        // vWorldPosition is camera-relative so camera is at origin: view dir = -vWorldPosition
+        vec3 vd=normalize(-vWorldPosition);
         float spec=pow(max(dot(normal,normalize(u_sunDir+vd)),0.),128.)*1.5;
         diffuse+=spec;
     }
-    vec3 vdr=cameraPosition-vWorldPosition; float vdist=length(vdr);
+    // Camera is at origin in camera-relative space
+    vec3 vdr=-vWorldPosition; float vdist=length(vdr);
     vec3 nv=vdist>.0001?vdr/vdist:vPlanetNormal;
     float headlamp=max(dot(normal,nv),0.)*.15;
     vec3 litColor=finalColor*(diffuse+.18+headlamp);
@@ -438,7 +443,8 @@ void main(){
     vec3 fogColor=mix(u_atmosZenith, fogHoriz, .8);
     fogColor+=vec3(1.,.8,.4)*pow(max(dot(-nv,u_sunDir),0.),8.)*dayMix;
 
-    float camAlt=max(length(cameraPosition-u_planetCenter)-u_radius,0.);
+    // u_planetCenter is (planet - camera) in camera-relative space; length = cam-to-planet dist
+    float camAlt=max(length(u_planetCenter)-u_radius,0.);
     float thickness=u_radius*.25;
     float density=mix(.00015,.000005,clamp(camAlt/thickness,0.,1.))*u_atmosOpacity;
     float fogFactor=clamp(exp(-density*vdist),0.,1.);
@@ -1183,6 +1189,13 @@ function animate(){
 
     if(pl&&!transitioning){
         const camRel=camera.position.clone().sub(pl.position);
+        // Keep u_planetCenter as (planetPos - cameraPos) so the terrain vertex shader
+        // works with small numbers, preventing float32 jitter at galaxy-scale distances.
+        sharedU.planetCenter.value.set(
+            pl.position.x-camera.position.x,
+            pl.position.y-camera.position.y,
+            pl.position.z-camera.position.z
+        );
         for(const c of rootChunks) c.update(camRel,pr);
     }
 
