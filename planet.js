@@ -335,11 +335,10 @@ void main(){
     vNormal = normalize(cross(pA, pB));
 
     vLocalPos = localPos;
-    // u_planetCenter is updated every frame as (planet.position - camera.position) in JS float64.
-    // This keeps vWorldPosition small, avoiding float32 catastrophic cancellation at galaxy scale.
-    // Rotation-only view matrix is used since the camera translation is already baked in.
+    // Floating origin: the focused planet is always at scene (0,0,0), so every
+    // coordinate here is small and float32-safe (u_planetCenter stays at zero).
     vWorldPosition = localPos + u_planetCenter;
-    gl_Position = projectionMatrix*mat4(mat3(viewMatrix))*vec4(vWorldPosition,1.);
+    gl_Position = projectionMatrix*viewMatrix*vec4(vWorldPosition,1.);
 }`;
 
 // ─── PLANET TERRAIN FRAGMENT SHADER ───────────────────────────────────────────
@@ -424,13 +423,11 @@ void main(){
     // Lighting
     float diffuse = max(dot(vElevation<u_waterLevel-.005 ? vPlanetNormal : normal, u_sunDir), 0.);
     if(vElevation<=u_waterLevel+.001){
-        // vWorldPosition is camera-relative so camera is at origin: view dir = -vWorldPosition
-        vec3 vd=normalize(-vWorldPosition);
+        vec3 vd=normalize(cameraPosition-vWorldPosition);
         float spec=pow(max(dot(normal,normalize(u_sunDir+vd)),0.),128.)*1.5;
         diffuse+=spec;
     }
-    // Camera is at origin in camera-relative space
-    vec3 vdr=-vWorldPosition; float vdist=length(vdr);
+    vec3 vdr=cameraPosition-vWorldPosition; float vdist=length(vdr);
     vec3 nv=vdist>.0001?vdr/vdist:vPlanetNormal;
     float headlamp=max(dot(normal,nv),0.)*.15;
     vec3 litColor=finalColor*(diffuse+.18+headlamp);
@@ -443,8 +440,7 @@ void main(){
     vec3 fogColor=mix(u_atmosZenith, fogHoriz, .8);
     fogColor+=vec3(1.,.8,.4)*pow(max(dot(-nv,u_sunDir),0.),8.)*dayMix;
 
-    // u_planetCenter is (planet - camera) in camera-relative space; length = cam-to-planet dist
-    float camAlt=max(length(u_planetCenter)-u_radius,0.);
+    float camAlt=max(length(cameraPosition-u_planetCenter)-u_radius,0.);
     float thickness=u_radius*.25;
     float density=mix(.00015,.000005,clamp(camAlt/thickness,0.,1.))*u_atmosOpacity;
     float fogFactor=clamp(exp(-density*vdist),0.,1.);
@@ -556,7 +552,7 @@ class PlanetChunk {
         const hDist=camRelative.clone().normalize().angleTo(this.normalizedCenter)*planetRadius;
         const altPen=Math.max(0,camR-(planetRadius+planetRadius*.15));
         const eDist=Math.sqrt(hDist*hDist+altPen*altPen);
-        const thresh=planetRadius*(4.5/Math.pow(1.85,this.level));
+        const thresh=planetRadius*(6.5/Math.pow(1.85,this.level));
         if(this.level<MAX_LOD_LEVEL&&eDist<thresh){
             if(!this.isSubdivided)this.subdivide();
             this.mesh.visible=false;
@@ -811,6 +807,15 @@ const keys={};
 const sunDir=new THREE.Vector3(1,.8,.5).normalize();
 const _proj=new THREE.Vector3();
 
+// ── Floating origin ───────────────────────────────────────────────────────────
+// Galaxy coordinates span ±30M units; GPU float32 only resolves ~2-4 units at
+// that magnitude, which made terrain vertices visibly jitter. The scene origin
+// is therefore re-based onto the focused planet: planet center = (0,0,0), and
+// worldOrigin records where the scene origin sits in absolute galaxy space.
+const worldOrigin=new THREE.Vector3();
+const _ORIGIN=new THREE.Vector3();   // focused planet center in scene space
+let sunMesh;
+
 function focusedPlanet(){ return (galaxySystems[focusedSysIdx]||{planets:[]}).planets[focusedPlIdx]; }
 
 // ─── FOCUS PLANET ─────────────────────────────────────────────────────────────
@@ -818,6 +823,13 @@ function focusPlanet(sysIdx, plIdx, immediate=false){
     focusedSysIdx=sysIdx; focusedPlIdx=plIdx;
     const pl=focusedPlanet();
     if(!pl) return;
+
+    // Rebase scene origin onto this planet (shift computed in JS float64)
+    const shift=worldOrigin.clone().sub(pl.position);
+    camera.position.add(shift);
+    controls.target.add(shift);
+    worldOrigin.copy(pl.position);
+    dotPoints.position.copy(worldOrigin).negate();   // dot buffer keeps absolute coords
 
     // Destroy current LOD
     for(const c of rootChunks) c.destroy();
@@ -828,7 +840,7 @@ function focusPlanet(sysIdx, plIdx, immediate=false){
 
     // Update shared uniforms — single object mutated, all chunks see change
     sharedU.seedOffset.value.copy(pl.seedOffset);
-    sharedU.planetCenter.value.copy(pl.position);
+    sharedU.planetCenter.value.set(0,0,0);
     sharedU.radius.value=pl.radius;
     sharedU.waterLevel.value=t.waterLevel;
     sharedU.snowLine.value=t.snowLine;
@@ -859,20 +871,25 @@ function focusPlanet(sysIdx, plIdx, immediate=false){
     elevMat.uniforms.u_terrainParam.value=t.terrainParam||3.0;
     elevMat.uniforms.u_terrainParam2.value=t.terrainParam2||0.15;
 
-    // Atmosphere + cloud meshes follow planet
-    atmosMesh.position.copy(pl.position);
+    // Atmosphere + clouds sit on the focused planet, i.e. at the scene origin
+    atmosMesh.position.set(0,0,0);
     atmosMesh.scale.setScalar(pl.radius/BASE_RADIUS);
-    atmosMat.uniforms.u_planetCenter.value.copy(pl.position);
+    atmosMat.uniforms.u_planetCenter.value.set(0,0,0);
     atmosMat.uniforms.u_radius.value=pl.radius;
     atmosMat.uniforms.u_atmosZenith.value.set(...t.atmosZenith);
     atmosMat.uniforms.u_atmosHorizon.value.set(...t.atmosHorizon);
     atmosMat.uniforms.u_atmosOpacity.value=t.atmosOpacity;
 
-    cloudMesh.position.copy(pl.position);
+    cloudMesh.position.set(0,0,0);
     cloudMesh.scale.setScalar(pl.radius/BASE_RADIUS);
     cloudMesh.visible=t.hasClouds;
     cloudMatRef.uniforms.u_seedOffset.value.copy(pl.seedOffset);
     cloudMatRef.uniforms.u_cloudDensity.value=t.cloudDensity;
+
+    // Sun billboard: same direction for all planets, distance scaled to radius
+    // so its angular size stays constant (~0.5 deg like the real sun)
+    sunMesh.position.copy(sunDir).multiplyScalar(pl.radius*20);
+    sunMesh.scale.setScalar((pl.radius*20)/21000);
 
     // Build LOD
     for(const f of CUBE_FACES)
@@ -897,12 +914,13 @@ function focusPlanet(sysIdx, plIdx, immediate=false){
         const vd=camera.position.clone().sub(controls.target).normalize();
         transitionStartCam=camera.position.clone();
         transitionStartTgt=controls.target.clone();
-        transitionEndTgt=pl.position.clone();
-        transitionEndCam=pl.position.clone().add(vd.multiplyScalar(pl.radius*3.5));
+        transitionEndTgt=new THREE.Vector3();              // planet center = origin
+        transitionEndCam=vd.multiplyScalar(pl.radius*3.5); // arrival orbit position
         transitioning=true; transitionT=0;
     } else {
-        controls.target.copy(pl.position);
-        camera.position.copy(pl.position).add(new THREE.Vector3(0,0,pl.radius*3.5));
+        transitioning=false;   // cancel any in-flight transition (e.g. seed regen)
+        controls.target.set(0,0,0);
+        camera.position.set(0,0,pl.radius*3.5);
     }
 
     const sys=galaxySystems[sysIdx];
@@ -935,8 +953,8 @@ function init(){
     const dl=new THREE.DirectionalLight(0xfff0dd,1.2);
     dl.position.copy(sunDir); scene.add(dl);
 
-    // Sun sphere
-    const sunMesh=new THREE.Mesh(new THREE.SphereGeometry(200,16,16),new THREE.MeshBasicMaterial({color:0xffeebb}));
+    // Sun sphere (repositioned per planet in focusPlanet)
+    sunMesh=new THREE.Mesh(new THREE.SphereGeometry(200,16,16),new THREE.MeshBasicMaterial({color:0xffeebb}));
     sunMesh.position.copy(sunDir).multiplyScalar(BASE_RADIUS*3.5);
     scene.add(sunMesh);
 
@@ -1081,7 +1099,7 @@ function init(){
         let bestI=-1, bestD=20*20;
         allPlanetsFlat.forEach((entry,i)=>{
             if(entry.sysIdx===focusedSysIdx&&entry.plIdx===focusedPlIdx) return;
-            _proj.copy(entry.planet.position).project(camera);
+            _proj.copy(entry.planet.position).sub(worldOrigin).project(camera);
             if(_proj.z>1) return;
             const sx=(_proj.x*.5+.5)*innerWidth, sy=(-.5*_proj.y+.5)*innerHeight;
             const d=(sx-cx)**2+(sy-cy)**2;
@@ -1153,7 +1171,7 @@ function animate(){
         controls.target.lerpVectors(transitionStartTgt,transitionEndTgt,t);
         if(transitionT>=1){ transitioning=false; controls.update(); }
     } else if(isWalking){
-        const pp=pl.position;
+        const pp=_ORIGIN;   // focused planet center is always the scene origin
         const up=camera.position.clone().sub(pp).normalize();
         if(Math.abs(up.y+1.)<.001) up.z+=.001; up.normalize();
         const aq=new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0),up);
@@ -1176,7 +1194,7 @@ function animate(){
     } else {
         controls.update();
         if(pl){
-            const off=camera.position.clone().sub(pl.position);
+            const off=camera.position.clone();   // relative to planet at origin
             const elev=getElevAt(off.clone().normalize(),renderer);
             const gr=pr+elev*pr*.08;
             controls.minDistance=gr+2.;
@@ -1187,17 +1205,9 @@ function animate(){
         }
     }
 
-    if(pl&&!transitioning){
-        const camRel=camera.position.clone().sub(pl.position);
-        // Keep u_planetCenter as (planetPos - cameraPos) so the terrain vertex shader
-        // works with small numbers, preventing float32 jitter at galaxy-scale distances.
-        sharedU.planetCenter.value.set(
-            pl.position.x-camera.position.x,
-            pl.position.y-camera.position.y,
-            pl.position.z-camera.position.z
-        );
-        for(const c of rootChunks) c.update(camRel,pr);
-    }
+    // LOD update runs every frame — including during transit, so the planet
+    // meshes in progressively as the camera flies toward it.
+    if(pl) for(const c of rootChunks) c.update(camera.position,pr);
 
     renderer.render(scene,camera);
 }
